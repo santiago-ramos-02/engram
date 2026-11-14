@@ -1728,3 +1728,49 @@ func TestProjectScopedExportKeepsUntrackedNotesAndHubs(t *testing.T) {
 		t.Error("project-scoped export dropped another project's sync state entry")
 	}
 }
+
+func TestExportSessionHubFileNamesAvoidCharactersWindowsRejects(t *testing.T) {
+	vault := t.TempDir()
+	sessionID := "01a12206-b05b-74e5-a252-ad3a51985dc3:resume:2"
+	ms := &mockStore{
+		exportData: &store.ExportData{
+			Sessions: []store.Session{{ID: sessionID, Project: "engram"}},
+			Observations: []store.Observation{{
+				ID:        1,
+				SessionID: sessionID,
+				Type:      "bugfix",
+				Title:     "Resumed session hub",
+				Content:   "content",
+				Scope:     "project",
+				CreatedAt: "2026-09-10T00:00:00Z",
+				UpdatedAt: "2026-09-10T00:00:00Z",
+				Project:   strPtr("engram"),
+			}},
+		},
+	}
+
+	result, err := NewExporter(ms, ExportConfig{VaultPath: vault, GraphConfig: GraphConfigSkip}).Export()
+	if err != nil {
+		t.Fatalf("Export() error: %v", err)
+	}
+	if result.Created != 1 || result.HubsCreated != 1 || len(result.Errors) != 0 {
+		t.Fatalf("result = %+v, want one observation and one hub without errors", result)
+	}
+
+	name := "01a12206-b05b-74e5-a252-ad3a51985dc3-resume-2.md"
+	content, err := os.ReadFile(filepath.Join(vault, "engram", "_sessions", name))
+	if err != nil {
+		t.Fatalf("session hub %q: %v", name, err)
+	}
+	if !strings.Contains(string(content), "session_id: "+sessionID+"\n") {
+		t.Fatalf("session hub lost the real session id:\n%s", content)
+	}
+
+	state, err := ReadState(filepath.Join(vault, "engram", ".engram-sync-state.json"))
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if got, want := state.SessionHubs[sessionID], filepath.Join("_sessions", name); got != want {
+		t.Fatalf("state.SessionHubs[%q] = %q, want %q", sessionID, got, want)
+	}
+}

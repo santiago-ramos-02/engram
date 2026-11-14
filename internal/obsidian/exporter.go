@@ -45,6 +45,16 @@ func NewExporter(s StoreReader, cfg ExportConfig) *Exporter {
 	return &Exporter{store: s, config: cfg}
 }
 
+// noteNameReplacer replaces the characters Windows and Obsidian reject in a
+// note's file name. Resumed sessions carry them: "<id>:resume:2".
+var noteNameReplacer = strings.NewReplacer(":", "-", "*", "-", "?", "-", "\"", "-", "<", "-", ">", "-", "|", "-")
+
+// noteFileName returns name as a note file name every platform and Obsidian
+// accept. Path separators stay, so nested session IDs keep their directories.
+func noteFileName(name string) string {
+	return noteNameReplacer.Replace(name) + ".md"
+}
+
 // sanitizePathComponent strips path separators and dot-dot sequences from a
 // single path component (project name or observation type), preventing path
 // traversal attacks when the value is used inside filepath.Join.
@@ -459,7 +469,8 @@ func (e *Exporter) Export() (*ExportResult, error) {
 		if len(refs) == 0 {
 			continue
 		}
-		hubPath := filepath.Join(sessionsDir, sessionID+".md")
+		hubName := noteFileName(sessionID)
+		hubPath := filepath.Join(sessionsDir, hubName)
 		cleanSessionsDir := filepath.Clean(sessionsDir)
 		cleanHubPath := filepath.Clean(hubPath)
 		if !strings.HasPrefix(cleanHubPath, cleanSessionsDir+string(filepath.Separator)) {
@@ -467,11 +478,11 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			continue
 		}
 		content := SessionHubMarkdown(sessionID, refs)
-		if err := writeSessionHub(sessionsDir, sessionID+".md", content); err != nil {
+		if err := writeSessionHub(sessionsDir, hubName, content); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("write session hub %s: %w", hubPath, err))
 			continue
 		}
-		state.SessionHubs[sessionID] = filepath.Join("_sessions", sessionID+".md")
+		state.SessionHubs[sessionID] = filepath.Join("_sessions", hubName)
 		result.HubsCreated++
 	}
 
@@ -480,8 +491,8 @@ func (e *Exporter) Export() (*ExportResult, error) {
 		if !ShouldCreateTopicHub(len(refs)) {
 			continue
 		}
-		safeName := strings.ReplaceAll(prefix, "/", "--")
-		hubPath := filepath.Join(topicsDir, safeName+".md")
+		hubName := noteFileName(strings.ReplaceAll(prefix, "/", "--"))
+		hubPath := filepath.Join(topicsDir, hubName)
 		content := TopicHubMarkdown(prefix, refs)
 		var writeErr error
 		if fullScope {
@@ -492,7 +503,7 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			if writeErr == nil && !created {
 				// Shared hubs, including competing creations, must not be replaced
 				// with references from only the selected project.
-				state.TopicHubs[prefix] = filepath.Join("_topics", safeName+".md")
+				state.TopicHubs[prefix] = filepath.Join("_topics", hubName)
 				continue
 			}
 		}
@@ -500,7 +511,7 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			result.Errors = append(result.Errors, fmt.Errorf("write topic hub %s: %w", hubPath, writeErr))
 			continue
 		}
-		state.TopicHubs[prefix] = filepath.Join("_topics", safeName+".md")
+		state.TopicHubs[prefix] = filepath.Join("_topics", hubName)
 		result.HubsCreated++
 	}
 
