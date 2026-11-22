@@ -3637,9 +3637,9 @@ const continuationSessionsQuery = `SELECT id, ended_at FROM sessions WHERE id >=
 // continuationSessionTx selects the lowest numeric live continuation, or the
 // next ordinal after all numeric suffixes. Literal prefix comparison avoids SQL
 // wildcard interpretation. Arbitrary precision ordinals impose no restart cap.
-func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
+func continuationSessionTx(ctx context.Context, tx *sql.Tx, root string) (string, error) {
 	var endedAt *string
-	err := tx.QueryRow(`SELECT ended_at FROM sessions WHERE id = ?`, root).Scan(&endedAt)
+	err := tx.QueryRowContext(ctx, `SELECT ended_at FROM sessions WHERE id = ?`, root).Scan(&endedAt)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && endedAt == nil) {
 		return root, nil
 	}
@@ -3647,7 +3647,7 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 		return "", err
 	}
 	prefix := root + ":resume:"
-	rows, err := tx.Query(continuationSessionsQuery, prefix+"0", prefix+":")
+	rows, err := tx.QueryContext(ctx, continuationSessionsQuery, prefix+"0", prefix+":")
 	if err != nil {
 		return "", err
 	}
@@ -3776,7 +3776,7 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 					}
 				}
 			}
-			id, err = continuationSessionTx(tx, root)
+			id, err = continuationSessionTx(context.Background(), tx, root)
 			if err != nil {
 				return err
 			}
@@ -3900,7 +3900,7 @@ var ErrRuntimeSessionScopeConflict = errors.New("runtime session scope conflict"
 // ErrRuntimeSessionEffectiveIDMismatch means the live session differs from the caller's expectation.
 var ErrRuntimeSessionEffectiveIDMismatch = errors.New("runtime session effective ID mismatch")
 
-func runtimeSessionTx(tx *sql.Tx, root, project, directory, mode string) (string, error) {
+func runtimeSessionTx(ctx context.Context, tx *sql.Tx, root, project, directory, mode string) (string, error) {
 	if err := validateSessionID(root); err != nil {
 		return "", err
 	}
@@ -3914,12 +3914,19 @@ func runtimeSessionTx(tx *sql.Tx, root, project, directory, mode string) (string
 	validate := func(id string, live bool) error {
 		var owner, ownership, scope string
 		var ended *string
-		if err := tx.QueryRow(`SELECT ifnull(project, ''), ifnull(ownership_mode, ''), ifnull(directory, ''), ended_at FROM sessions WHERE id = ?`, id).Scan(&owner, &ownership, &scope, &ended); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT ifnull(project, ''), ifnull(ownership_mode, ''), ifnull(directory, ''), ended_at FROM sessions WHERE id = ?`, id).Scan(&owner, &ownership, &scope, &ended); err != nil {
 			return err
 		}
 		owner, _ = NormalizeProject(strings.TrimSpace(owner))
 		ownership = strings.TrimSpace(ownership)
-		if sessionRegistrationProjectError(id, owner, ownership, project, mode) != nil || ownership != mode || strings.TrimSpace(directory) == "" || strings.TrimSpace(scope) == "" || projectpkg.RuntimeWorktreeDirectory(scope) != projectpkg.RuntimeWorktreeDirectory(directory) {
+		if sessionRegistrationProjectError(id, owner, ownership, project, mode) != nil || ownership != mode || strings.TrimSpace(directory) == "" || strings.TrimSpace(scope) == "" {
+			return ErrRuntimeSessionScopeConflict
+		}
+		scopeMatches := projectpkg.RuntimeWorktreeDirectoryContext(ctx, scope) == projectpkg.RuntimeWorktreeDirectoryContext(ctx, directory)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !scopeMatches {
 			return ErrRuntimeSessionScopeConflict
 		}
 		if live && ended != nil {
@@ -3930,7 +3937,7 @@ func runtimeSessionTx(tx *sql.Tx, root, project, directory, mode string) (string
 	if err := validate(root, false); err != nil {
 		return "", err
 	}
-	id, err := continuationSessionTx(tx, root)
+	id, err := continuationSessionTx(ctx, tx, root)
 	if err != nil {
 		return "", err
 	}
@@ -3946,9 +3953,24 @@ func (s *Store) ResolveRuntimeSessionWithOwnershipMode(root, project, directory,
 	var id string
 	err := s.withTx(func(tx *sql.Tx) error {
 		var err error
-		id, err = runtimeSessionTx(tx, root, project, directory, mode)
+		id, err = runtimeSessionTx(context.Background(), tx, root, project, directory, mode)
 		return err
 	})
+	return id, err
+}
+
+// ResolveRuntimeSessionWithOwnershipModeContext reads one cancellable snapshot
+// of the root and its effective identity without reserving the WAL writer.
+func (s *Store) ResolveRuntimeSessionWithOwnershipModeContext(ctx context.Context, root, project, directory, mode string) (string, error) {
+	var id string
+	err := s.withReadTxContext(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, err = runtimeSessionTx(ctx, tx, root, project, directory, mode)
+		return err
+	})
+	if cancellation := ctx.Err(); cancellation != nil {
+		return "", cancellation
+	}
 	return id, err
 }
 
@@ -3969,7 +3991,7 @@ func (s *Store) EndRuntimeSessionIfCurrent(root, project, directory, mode, summa
 func (s *Store) endRuntimeSession(root, project, directory, mode, summary, expectedID string) (string, error) {
 	var id string
 	err := s.withTx(func(tx *sql.Tx) error {
-		currentID, err := runtimeSessionTx(tx, root, project, directory, mode)
+		currentID, err := runtimeSessionTx(context.Background(), tx, root, project, directory, mode)
 		if err != nil {
 			return err
 		}
@@ -4168,6 +4190,10 @@ func (s *Store) ActiveRuntimeSessions(project string, directories ...string) ([]
 // carries rows that identify no project, so the column is read through ifnull():
 // an unscoped listing reads every session row and must not die on one of them.
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
+	return s.recentSessions(context.Background(), project, limit)
+}
+
+func (s *Store) recentSessions(ctx context.Context, project string, limit int) ([]SessionSummary, error) {
 	// Normalize project filter for case-insensitive matching
 	project, _ = NormalizeProject(project)
 
@@ -4192,7 +4218,7 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 	query += " GROUP BY s.id ORDER BY MAX(datetime(COALESCE(o.created_at, s.started_at))) DESC, s.id DESC LIMIT ?"
 	args = append(args, limit)
 
-	rows, err := s.queryItHook(s.db, query, args...)
+	rows, err := s.queryContextSection(ctx, s.db, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -4635,14 +4661,14 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 // ContextOptions.Pinned) use the unexported pinnedObservationsLimit helper,
 // which this delegates to with limit=0 ("no LIMIT clause", i.e. unbounded).
 func (s *Store) PinnedObservations(project, scope string) ([]Observation, error) {
-	return s.pinnedObservationsLimit(project, scope, 0, false)
+	return s.pinnedObservationsLimit(context.Background(), project, scope, 0, false)
 }
 
 // pinnedObservationsLimit is the shared query behind PinnedObservations. A
 // limit <= 0 means "no LIMIT clause" (every pinned row, matching
 // PinnedObservations' historical unbounded behavior); a positive limit caps
 // the result via SQL LIMIT.
-func (s *Store) pinnedObservationsLimit(project, scope string, limit int, compact bool) ([]Observation, error) {
+func (s *Store) pinnedObservationsLimit(ctx context.Context, project, scope string, limit int, compact bool) ([]Observation, error) {
 	project, _ = NormalizeProject(project)
 
 	query := `
@@ -4666,7 +4692,7 @@ func (s *Store) pinnedObservationsLimit(project, scope string, limit int, compac
 		query += " LIMIT ?"
 		args = append(args, limit)
 	}
-	return s.queryContextObservations(s.db, query, args, compact)
+	return s.queryContextObservations(ctx, s.db, query, args, compact)
 }
 
 func (s *Store) PinObservation(id int64) error {
@@ -4696,7 +4722,7 @@ func (s *Store) setObservationPinned(id int64, pinned bool) error {
 	return nil
 }
 
-func (s *Store) recentUnpinnedObservations(project, scope string, limit int, compact bool) ([]Observation, error) {
+func (s *Store) recentUnpinnedObservations(ctx context.Context, project, scope string, limit int, compact bool) ([]Observation, error) {
 	project, _ = NormalizeProject(project)
 	if limit <= 0 {
 		limit = s.cfg.MaxContextResults
@@ -4718,7 +4744,7 @@ func (s *Store) recentUnpinnedObservations(project, scope string, limit int, com
 	}
 	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC LIMIT ?"
 	args = append(args, limit)
-	return s.queryContextObservations(s.db, query, args, compact)
+	return s.queryContextObservations(ctx, s.db, query, args, compact)
 }
 
 func (s *Store) compactionObservations(sessionID, project string, pinned bool, limit int) ([]Observation, error) {
@@ -5152,6 +5178,10 @@ func truncateContent(content string, max int) string {
 }
 
 func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
+	return s.recentPrompts(context.Background(), project, limit)
+}
+
+func (s *Store) recentPrompts(ctx context.Context, project string, limit int) ([]Prompt, error) {
 	// Normalize project filter for case-insensitive matching
 	project, _ = NormalizeProject(project)
 
@@ -5170,7 +5200,7 @@ func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
 	query += " ORDER BY created_at DESC LIMIT ?"
 	args = append(args, limit)
 
-	rows, err := s.queryItHook(s.db, query, args...)
+	rows, err := s.queryContextSection(ctx, s.db, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -6488,6 +6518,11 @@ func (s *Store) statsForProjectLimit(project string, maxProjects int) (*Stats, i
 // The sync_enrolled_projects branch ensures a project enrolled via EnrollProject()
 // without any other data is still recognized (JC1).
 func (s *Store) ProjectExists(name string) (bool, error) {
+	return s.ProjectExistsContext(context.Background(), name)
+}
+
+// ProjectExistsContext supports cancellation while validating a project.
+func (s *Store) ProjectExistsContext(ctx context.Context, name string) (bool, error) {
 	// Use LOWER(project) = ? so legacy data stored with mixed-case names
 	// (created before project normalization was enforced on writes) is found
 	// when queried with the current normalized (lowercase) name. The caller
@@ -6503,7 +6538,7 @@ SELECT 1 FROM (
   SELECT project FROM sync_enrolled_projects WHERE LOWER(project) = ?
 ) LIMIT 1`
 	var dummy int
-	err := s.db.QueryRow(query, name, name, name, name).Scan(&dummy)
+	err := s.db.QueryRowContext(ctx, query, name, name, name, name).Scan(&dummy)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -6566,6 +6601,11 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 // markdown block for the given project/scope, honoring the per-section caps
 // and Compact rendering in opts. See ContextOptions for the cap convention.
 func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOptions) (string, error) {
+	return s.FormatContextWithOptionsContext(context.Background(), project, scope, opts)
+}
+
+// FormatContextWithOptionsContext honors cancellation for all reads used to build context.
+func (s *Store) FormatContextWithOptionsContext(ctx context.Context, project, scope string, opts ContextOptions) (string, error) {
 	var (
 		sessions     []SessionSummary
 		pinned       []Observation
@@ -6579,7 +6619,7 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 		if limit == 0 {
 			limit = 5
 		}
-		if sessions, err = s.RecentSessions(project, limit); err != nil {
+		if sessions, err = s.recentSessions(ctx, project, limit); err != nil {
 			return "", err
 		}
 	}
@@ -6595,7 +6635,7 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 				limit = byteLimit
 			}
 		}
-		if pinned, err = s.pinnedObservationsLimit(project, scope, limit, opts.Compact); err != nil {
+		if pinned, err = s.pinnedObservationsLimit(ctx, project, scope, limit, opts.Compact); err != nil {
 			return "", err
 		}
 	}
@@ -6606,7 +6646,7 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 		if s.contextHistoryNow != nil {
 			now = s.contextHistoryNow().UTC()
 		}
-		observations, olderGroups, err = s.contextHistory(project, scope, opts.Observations, now, opts.Compact)
+		observations, olderGroups, err = s.contextHistory(ctx, project, scope, opts.Observations, now, opts.Compact)
 		if err != nil {
 			return "", err
 		}
@@ -6618,7 +6658,7 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 		if limit == 0 {
 			limit = s.cfg.MaxContextResults
 		}
-		if observations, err = s.recentUnpinnedObservations(project, scope, limit, opts.Compact); err != nil {
+		if observations, err = s.recentUnpinnedObservations(ctx, project, scope, limit, opts.Compact); err != nil {
 			return "", err
 		}
 	}
@@ -6628,7 +6668,7 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 		if limit == 0 {
 			limit = 10
 		}
-		if prompts, err = s.RecentPrompts(project, limit); err != nil {
+		if prompts, err = s.recentPrompts(ctx, project, limit); err != nil {
 			return "", err
 		}
 	}
@@ -9756,7 +9796,12 @@ type ProjectNameCount struct {
 // ListProjectNames returns all distinct project names from observations,
 // ordered alphabetically. Used for fuzzy matching and consolidation.
 func (s *Store) ListProjectNames() ([]string, error) {
-	rows, err := s.queryItHook(s.db,
+	return s.ListProjectNamesContext(context.Background())
+}
+
+// ListProjectNamesContext supports cancellation while reading project names.
+func (s *Store) ListProjectNamesContext(ctx context.Context) ([]string, error) {
+	rows, err := s.queryContextSection(ctx, s.db,
 		`SELECT DISTINCT project FROM observations
 		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL
 		 ORDER BY project`,
@@ -10523,13 +10568,17 @@ func (s *Store) withWriteTimings(timings *WriteTimings, fn func(tx *sql.Tx) erro
 // modernc.org/sqlite v1.45.0 maps ReadOnly to deferred BEGIN, overriding
 // storeDSN's _txlock=immediate. Read-only planners therefore do not reserve a
 // writer lock; writable paths continue to use withTx.
-func (s *Store) withReadTx(fn func(tx *sql.Tx) error) (err error) {
-	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+func (s *Store) withReadTx(fn func(tx *sql.Tx) error) error {
+	return s.withReadTxContext(context.Background(), fn)
+}
+
+func (s *Store) withReadTxContext(ctx context.Context, fn func(tx *sql.Tx) error) (err error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && (!errors.Is(rollbackErr, sql.ErrTxDone) || ctx.Err() == nil) {
 			if err != nil {
 				err = errors.Join(err, rollbackErr)
 			} else {
