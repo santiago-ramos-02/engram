@@ -111,6 +111,16 @@ var (
 	}
 )
 
+// IsCanonicalProjectSource accepts the sources used by successful local hook resolution.
+func IsCanonicalProjectSource(source string) bool {
+	switch source {
+	case SourceConfig, SourceGitRemote, SourceGitRoot, SourceGitChild, SourceDirBasename, SourceProcessOverride:
+		return true
+	default:
+		return false
+	}
+}
+
 // DetectionResult carries the full output of DetectProjectFull.
 type DetectionResult struct {
 	// Project is the resolved project name. Empty when detection returns an error.
@@ -130,6 +140,9 @@ type DetectionResult struct {
 	// Org is the optional grouping label from .engram/config.json's "org" field.
 	// Only populated when Source==SourceConfig; empty means unset (#776).
 	Org string
+
+	// repositoryID is local Git evidence for implicit capture advisories.
+	repositoryID string
 }
 
 // DetectProjectFull resolves the project for dir using a 6-case algorithm:
@@ -220,10 +233,11 @@ func detectProjectFull(dir string, options DetectionOptions, historyDirectory st
 			return childResult
 		}
 		return DetectionResult{
-			Project: childResult.Project,
-			Source:  SourceGitChild,
-			Path:    childResult.Path,
-			Warning: "auto-promoted child repository: " + childResult.Project,
+			Project:      childResult.Project,
+			Source:       SourceGitChild,
+			Path:         childResult.Path,
+			Warning:      "auto-promoted child repository: " + childResult.Project,
+			repositoryID: childResult.repositoryID,
 		}
 	default:
 		if len(children) > 1 {
@@ -339,7 +353,7 @@ func detectFromGitBinding(dir string, options DetectionOptions, historyDirectory
 	if err != nil {
 		return DetectionResult{Source: source, Path: root, Error: err}, true
 	}
-	return DetectionResult{Project: binding.Project, Source: source, Path: root}, true
+	return DetectionResult{Project: binding.Project, Source: source, Path: root, repositoryID: binding.ID}, true
 }
 
 // requireHomeProject runs before history lookup or private binding publication.

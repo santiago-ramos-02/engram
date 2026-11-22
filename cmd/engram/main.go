@@ -1663,6 +1663,10 @@ func cmdSave(cfg store.Config) {
 		return
 	}
 
+	if advisory := resolved.ImplicitGitProjectCollisionWarning(s.DataDir()); advisory != "" {
+		_, _ = fmt.Fprintln(os.Stderr, advisory)
+	}
+
 	// --org wins when given explicitly; otherwise inherit from the nearest
 	// .engram/config.json org field for this cwd, independent of how the
 	// project name itself was resolved (#776).
