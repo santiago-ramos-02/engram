@@ -78,6 +78,7 @@ type SemanticPromptBuilder func(a, b store.ObservationSnippet) string
 
 type Server struct {
 	httpServer            *http.Server
+	startup               *LocalStartup
 	generationInvalidated chan struct{}
 	generationOnce        sync.Once
 	store                 *store.Store
@@ -304,17 +305,16 @@ func (s *Server) Start() error {
 		socketInfo os.FileInfo
 		err        error
 	)
-	if socketPath != "" {
+	if s.startup != nil {
+		ln = s.startup.listener
+	} else if socketPath != "" {
 		ln, socketInfo, err = listenSecureUnixSocket(socketPath)
 	} else {
 		ln, err = listenFn(network, addr)
 	}
 	if err != nil {
 		if s.sessionOwnedToken == "" && socketPath == "" && isAddressInUse(err) {
-			if s.instanceOwnsPort() {
-				return fmt.Errorf("engram server: listen %s: %w", addr, ErrPortOwned)
-			}
-			return fmt.Errorf("engram server: listen %s: already owned by a different or legacy instance", addr)
+			return fmt.Errorf("engram server: listen %s: %w", addr, s.portConflict())
 		}
 		return fmt.Errorf("engram server: listen %s: %w", addr, err)
 	}
@@ -350,9 +350,10 @@ func isAddressInUse(err error) bool {
 	return errors.Is(err, syscall.EADDRINUSE) || strings.Contains(message, "address already in use") || strings.Contains(message, "only one usage of each socket address")
 }
 
-func (s *Server) instanceOwnsPort() bool {
+func (s *Server) portConflict() error {
+	unknownOwner := errors.New("already owned by a different or legacy instance")
 	if s.instanceID == "" {
-		return false
+		return unknownOwner
 	}
 	client := http.Client{Timeout: 500 * time.Millisecond}
 	for attempt := 0; attempt < 5; attempt++ {
@@ -360,17 +361,25 @@ func (s *Server) instanceOwnsPort() bool {
 		if err == nil {
 			var health struct {
 				InstanceID string `json:"instance_id"`
+				Service    string `json:"service"`
+				Status     string `json:"status"`
 			}
 			err = json.NewDecoder(response.Body).Decode(&health)
 			_ = response.Body.Close()
-			if err == nil && health.InstanceID == s.instanceID {
-				return true
+			if err != nil {
+				return unknownOwner
 			}
-			return false
+			if response.StatusCode == http.StatusServiceUnavailable && health.Service == "engram" && health.Status == "starting" {
+				return errors.New("an Engram server is starting on the port")
+			}
+			if health.InstanceID == s.instanceID {
+				return ErrPortOwned
+			}
+			return unknownOwner
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return false
+	return unknownOwner
 }
 
 // Close stops the active listener and removes only the socket created by this
@@ -564,7 +573,7 @@ func (s *Server) routes() {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if err := checkServerReadiness(s.store); err != nil {
+	if err := checkServerReadiness(s.store, r.Context()); err != nil {
 		jsonError(w, http.StatusInternalServerError, "health check failed")
 		return
 	}
@@ -628,7 +637,21 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	effectiveID := body.ID
 	timings := requestWriteTimings(r)
 	var err error
-	effectiveID, err = s.store.RegisterSessionWithProjectProvenance(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode, body.Resume, body.Isolated, provenance, timings)
+	ctx := r.Context()
+	var refreshed bool
+	if mode == store.SessionOwnershipProjectOwned && !body.Resume && !body.Isolated && provenance == nil {
+		refreshed, err = s.store.TryRefreshProjectOwnedSession(ctx, body.ID, body.Project, timings)
+	}
+	if !refreshed && ctx.Err() != nil {
+		return
+	}
+	if !refreshed && err == nil {
+		directory := projectpkg.RuntimeWorktreeDirectoryContext(ctx, body.Directory)
+		if ctx.Err() != nil {
+			return
+		}
+		effectiveID, err = s.store.RegisterSessionWithProjectProvenance(body.ID, body.Project, directory, mode, body.Resume, body.Isolated, provenance, timings)
+	}
 	if err != nil {
 		var conflict *store.SessionProjectConflictError
 		switch {
@@ -1238,7 +1261,7 @@ func (s *Server) handleReviewMarkReviewed(w http.ResponseWriter, r *http.Request
 		jsonError(w, http.StatusBadRequest, "observation_id is required")
 		return
 	}
-	resolved, err := s.resolveRequestProjectWithDetector(r, projectpkg.ResolutionCurrent, true, s.captureProjectDetector(false))
+	resolved, err := s.resolveRequestProjectWithDetector(r, projectpkg.ResolutionCurrent, true, s.captureProjectDetector(projectpkg.DetectionOptions{}))
 	if err != nil {
 		s.writeProjectResolutionError(w, resolved, err)
 		return
@@ -1681,6 +1704,7 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 
 // handleCurrentProject returns canonical current-project detection metadata.
 func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
 	if cwd == "" {
 		var cwdErr error
@@ -1693,8 +1717,11 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 	res, err := projectpkg.Resolve(projectpkg.ResolutionOptions{
 		Mode:      projectpkg.ResolutionCurrent,
 		Directory: cwd,
-		Detect:    s.captureProjectDetector(false),
+		Detect:    s.captureProjectDetector(projectpkg.DetectionOptions{Context: ctx}),
 	})
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil && !errors.Is(err, projectpkg.ErrAmbiguousProject) {
 		s.writeProjectResolutionError(w, res, err)
 		return
@@ -1702,7 +1729,10 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 	// A process override chooses the project, independently of the caller's org.
 	// Inspection reads that label without establishing an implicit Git binding.
 	if res.Source == projectpkg.SourceProcessOverride {
-		res.Org = s.store.InspectProject(cwd).Org
+		res.Org = s.store.DetectProjectWithOptions(cwd, projectpkg.DetectionOptions{Context: ctx, InspectOnly: true}).Org
+		if ctx.Err() != nil {
+			return
+		}
 	}
 	jsonResponse(w, http.StatusOK, currentProjectPayload(cwd, res))
 }
@@ -1710,11 +1740,10 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 // captureProjectDetector protects context negotiation without tightening ordinary reads.
 // Inspection callers retain their no-binding contract; current-project keeps its
 // existing binding behavior after the HOME guard and history checks succeed.
-func (s *Server) captureProjectDetector(inspectOnly bool) func(string) projectpkg.DetectionResult {
+func (s *Server) captureProjectDetector(options projectpkg.DetectionOptions) func(string) projectpkg.DetectionResult {
+	options.RequireExplicitHomeProject = true
 	return func(directory string) projectpkg.DetectionResult {
-		return projectpkg.DetectProjectFullWithOptions(directory, projectpkg.DetectionOptions{
-			InspectOnly: inspectOnly, HistoryLookup: s.store.ProjectHistory, RequireExplicitHomeProject: true,
-		})
+		return s.store.DetectProjectWithOptions(directory, options)
 	}
 }
 

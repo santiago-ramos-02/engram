@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -64,7 +65,7 @@ func (p cloudDashboardStatusProvider) Status() dashboard.SyncStatus {
 }
 
 type cloudServerRuntime interface {
-	Start() error
+	Start(*cloudserver.StartupListener) error
 }
 
 type defaultCloudRuntime struct {
@@ -72,18 +73,21 @@ type defaultCloudRuntime struct {
 	store  *cloudstore.CloudStore
 }
 
-func (r *defaultCloudRuntime) Start() error {
+func (r *defaultCloudRuntime) Start(startup *cloudserver.StartupListener) error {
 	defer r.store.Close()
-	return r.server.Start()
+	return r.server.Start(startup)
 }
 
-var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
-	cs, err := cloudstore.New(cfg)
+var newCloudRuntime = func(ctx context.Context, cfg cloud.Config) (cloudServerRuntime, error) {
+	started := time.Now()
+	fmt.Fprintln(os.Stderr, "engram cloud startup: initializing PostgreSQL store and session index")
+	cs, err := cloudstore.NewContext(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	fmt.Fprintf(os.Stderr, "engram cloud startup: PostgreSQL store and session index initialized elapsed=%s\n", time.Since(started).Round(time.Millisecond))
 	allowedProjects := normalizeAllowedProjects(cfg.AllowedProjects)
-	if err := backfillAllowedProjectMutationChunks(context.Background(), cs, allowedProjects); err != nil {
+	if err := backfillAllowedProjectMutationChunks(ctx, cs, allowedProjects); err != nil {
 		_ = cs.Close()
 		return nil, err
 	}
@@ -186,17 +190,17 @@ func buildRuntimeAuthenticator(cfg cloud.Config, cs *cloudstore.CloudStore, allo
 }
 
 func backfillAllowedProjectMutationChunks(ctx context.Context, cs *cloudstore.CloudStore, projects []string) error {
-	for _, project := range projects {
+	for i, project := range projects {
+		started := time.Now()
+		fmt.Fprintf(os.Stderr, "engram cloud startup: checking mutation chunks for project=%q (%d/%d)\n", project, i+1, len(projects))
 		report, err := cs.BackfillMutationChunks(ctx, project, true)
 		if err != nil {
 			return fmt.Errorf("cloud repair materialize-mutations for project %q: %w", project, err)
 		}
-		if report.CandidateMutations > 0 || report.ChunksInserted > 0 {
-			fmt.Fprintf(os.Stderr,
-				"engram cloud repair materialize-mutations: project=%s candidates=%d already_materialized=%d chunks_planned=%d chunks_inserted=%d\n",
-				report.Project, report.CandidateMutations, report.AlreadyMaterialized, report.ChunksPlanned, report.ChunksInserted,
-			)
-		}
+		fmt.Fprintf(os.Stderr,
+			"engram cloud repair materialize-mutations: project=%q candidates=%d already_materialized=%d chunks_planned=%d chunks_inserted=%d elapsed=%s\n",
+			report.Project, report.CandidateMutations, report.AlreadyMaterialized, report.ChunksPlanned, report.ChunksInserted, time.Since(started).Round(time.Millisecond),
+		)
 	}
 	return nil
 }
@@ -1016,15 +1020,29 @@ func cmdCloudServe() {
 		fatal(err)
 		return
 	}
-	runtime, err := newCloudRuntime(runtimeCfg)
+	if err := runCloudServe(runtimeCfg); err != nil {
+		fatal(err)
+	}
+}
+
+var listenCloudDuringStartup = net.Listen
+
+func runCloudServe(cfg cloud.Config) error {
+	startup, err := cloudserver.ListenDuringStartup(cfg.BindHost, cfg.Port, listenCloudDuringStartup)
 	if err != nil {
-		fatal(err)
-		return
+		return err
 	}
-	fmt.Printf("Starting Engram cloud server on port %d\n", runtimeCfg.Port)
-	if err := runtime.Start(); err != nil {
-		fatal(err)
+	defer startup.Close()
+	ctx := startup.InitializationContext()
+	runtime, err := newCloudRuntime(ctx, cfg)
+	if err != nil {
+		if serveErr := context.Cause(ctx); serveErr != nil {
+			return serveErr
+		}
+		return err
 	}
+	fmt.Printf("Starting Engram cloud server on port %d\n", cfg.Port)
+	return runtime.Start(startup)
 }
 
 func validateCloudServeAuthConfig() error {

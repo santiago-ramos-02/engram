@@ -40,6 +40,11 @@ var ErrChunkConflict = errors.New("cloudstore: chunk id conflict")
 var ErrSessionIndexHistoricalResolutionRequired = errors.New("cloudstore: session index requires explicit historical resolution")
 
 func New(cfg cloud.Config) (*CloudStore, error) {
+	return NewContext(context.Background(), cfg)
+}
+
+// NewContext opens the Store and initializes its schema and session index.
+func NewContext(ctx context.Context, cfg cloud.Config) (*CloudStore, error) {
 	dsn := strings.TrimSpace(cfg.DSN)
 	if dsn == "" {
 		return nil, fmt.Errorf("cloudstore: database dsn is required")
@@ -48,14 +53,14 @@ func New(cfg cloud.Config) (*CloudStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cloudstore: open postgres: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
+	if err := db.PingContext(pingCtx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("cloudstore: ping postgres: %w", err)
 	}
 	store := &CloudStore{db: db}
-	if err := store.migrate(context.Background()); err != nil {
+	if err := store.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -560,12 +565,19 @@ func (cs *CloudStore) backfillProjectSessionsFromChunks(ctx context.Context) err
 			}
 			knownByProject[project] = known
 		}
-		sessionIDs := collectSessionIDsFromPayload(payload)
+		// Unreadable historical chunks supply no session IDs.
+		chunk, _ := engramsync.DecodeHistoricalChunk(payload)
+		sessionIDs := collectSessionIDs(chunk)
+		// KnownSessionIDs trims its project argument. Only an exact project
+		// match proves the row already exists under the stored project name.
+		exactProject := project == strings.TrimSpace(project)
 		for sessionID := range sessionIDs {
-			if sessionID != strings.TrimSpace(sessionID) {
-				if _, exists := known[sessionID]; !exists {
-					return fmt.Errorf("%w: project %q session_id %q has no exact index entry", ErrSessionIndexHistoricalResolutionRequired, project, sessionID)
-				}
+			_, indexed := known[sessionID]
+			if !indexed && sessionID != strings.TrimSpace(sessionID) {
+				return fmt.Errorf("%w: project %q session_id %q has no exact index entry", ErrSessionIndexHistoricalResolutionRequired, project, sessionID)
+			}
+			if indexed && exactProject {
+				delete(sessionIDs, sessionID)
 			}
 		}
 		if err := indexSessionIDs(ctx, cs.db, project, sessionIDs); err != nil {
@@ -603,8 +615,15 @@ func collectSessionIDs(chunk engramsync.ChunkData) map[string]struct{} {
 		}
 	}
 	for _, mutation := range chunk.Mutations {
+		if strings.TrimSpace(mutation.Entity) != store.SyncEntitySession {
+			continue
+		}
+		op := strings.TrimSpace(mutation.Op)
+		if op != "" && op != store.SyncOpUpsert {
+			continue
+		}
 		materialized, err := materializeChunkMutation("", mutation)
-		if err != nil || materialized == nil || materialized.Entity != store.SyncEntitySession || materialized.Op != store.SyncOpUpsert {
+		if err != nil || materialized == nil {
 			continue
 		}
 		session, err := sessionFromMaterializedMutation(*materialized)
@@ -1101,6 +1120,9 @@ func (cs *CloudStore) BackfillMutationChunks(ctx context.Context, project string
 
 	chunks := make([]materializedMutationChunk, 0)
 	for start := 0; start < len(missing); start += mutationBackfillChunkSize {
+		if err := ctx.Err(); err != nil {
+			return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: plan mutation chunk backfill: %w", err)
+		}
 		end := start + mutationBackfillChunkSize
 		if end > len(missing) {
 			end = len(missing)
@@ -1165,7 +1187,7 @@ func (cs *CloudStore) existingChunkMutationSignatures(ctx context.Context, proje
 		if err := rows.Scan(&payload); err != nil {
 			return nil, fmt.Errorf("cloudstore: scan existing chunk mutations: %w", err)
 		}
-		chunk, err := parseChunkData(payload)
+		chunk, err := engramsync.DecodeHistoricalChunk(payload)
 		if err != nil {
 			return nil, fmt.Errorf("cloudstore: parse existing chunk mutations: %w", err)
 		}
@@ -1358,21 +1380,35 @@ func syncMutationSignature(mutation store.SyncMutation) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.Join([]string{
+	fields := [...]string{
 		strings.TrimSpace(mutation.Project),
 		strings.TrimSpace(mutation.Entity),
 		mutationEntityKey(mutation.Entity, mutation.EntityKey),
 		strings.TrimSpace(mutation.Op),
-		normalized,
-	}, "\x00"), nil
+	}
+	size := len(fields) + len(normalized)
+	for _, field := range fields {
+		size += len(field)
+	}
+	var signature strings.Builder
+	signature.Grow(size)
+	for _, field := range fields {
+		signature.WriteString(field)
+		signature.WriteByte(0)
+	}
+	signature.Write(normalized)
+	return signature.String(), nil
 }
 
-func canonicalMutationPayload(payload []byte) (string, error) {
-	payload = normalizeJSON(payload)
-	if !json.Valid(payload) {
-		return "", fmt.Errorf("payload is not valid JSON")
+func canonicalMutationPayload(payload []byte) ([]byte, error) {
+	if normalized, ok := marshalNormalizedJSON(payload); ok {
+		return normalized, nil
 	}
-	return string(payload), nil
+	// Valid JSON numbers outside float64 range retain the original bytes.
+	if !json.Valid(payload) {
+		return nil, fmt.Errorf("payload is not valid JSON")
+	}
+	return payload, nil
 }
 
 // ListMutationsSince returns mutations with seq > sinceSeq, filtered to allowedProjects.
@@ -1471,15 +1507,19 @@ func chunkIDFromPayload(payload []byte) string {
 }
 
 func normalizeJSON(payload []byte) []byte {
+	if normalized, ok := marshalNormalizedJSON(payload); ok {
+		return normalized
+	}
+	return payload
+}
+
+func marshalNormalizedJSON(payload []byte) ([]byte, bool) {
 	var body any
 	if err := json.Unmarshal(payload, &body); err != nil {
-		return payload
+		return nil, false
 	}
 	normalized, err := json.Marshal(body)
-	if err != nil {
-		return payload
-	}
-	return normalized
+	return normalized, err == nil
 }
 
 type chunkSummary struct {

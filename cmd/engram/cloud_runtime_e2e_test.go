@@ -19,6 +19,59 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
+func TestCloudRuntimeReportsStartupOnStoreFailure(t *testing.T) {
+	stdout, stderr := captureOutput(t, func() {
+		runtime, err := newCloudRuntime(context.Background(), cloud.Config{})
+		if runtime != nil || err == nil || !strings.Contains(err.Error(), "database dsn is required") {
+			t.Fatalf("newCloudRuntime = (%v, %v), want missing DSN error", runtime, err)
+		}
+	})
+	if stdout != "" {
+		t.Errorf("unexpected stdout during startup: %q", stdout)
+	}
+	const want = "engram cloud startup: initializing PostgreSQL store and session index\n"
+	if stderr != want {
+		t.Errorf("startup stderr = %q, want %q", stderr, want)
+	}
+}
+
+func TestCloudRuntimeReportsStartupProgressInRepairOrder(t *testing.T) {
+	dsn := openIsolatedCloudRuntimeSchema(t)
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "")
+	t.Setenv("ENGRAM_CLOUD_INSECURE_NO_AUTH", "1")
+
+	stdout, stderr := captureOutput(t, func() {
+		runtime, err := newCloudRuntime(context.Background(), cloud.Config{
+			DSN:             dsn,
+			AllowedProjects: []string{"second", "first"},
+		})
+		if err != nil {
+			t.Fatalf("newCloudRuntime: %v", err)
+		}
+		t.Cleanup(func() { _ = runtime.(*defaultCloudRuntime).store.Close() })
+	})
+	if stdout != "" {
+		t.Errorf("unexpected stdout during startup: %q", stdout)
+	}
+	want := []string{
+		"engram cloud startup: initializing PostgreSQL store and session index",
+		"engram cloud startup: PostgreSQL store and session index initialized elapsed=",
+		`engram cloud startup: checking mutation chunks for project="second" (1/2)`,
+		`engram cloud repair materialize-mutations: project="second" candidates=0 already_materialized=0 chunks_planned=0 chunks_inserted=0 elapsed=`,
+		`engram cloud startup: checking mutation chunks for project="first" (2/2)`,
+		`engram cloud repair materialize-mutations: project="first" candidates=0 already_materialized=0 chunks_planned=0 chunks_inserted=0 elapsed=`,
+	}
+	lines := strings.Split(strings.TrimSuffix(stderr, "\n"), "\n")
+	if len(lines) != len(want) {
+		t.Fatalf("startup stderr = %q, want %d lines", stderr, len(want))
+	}
+	for i, prefix := range want {
+		if !strings.HasPrefix(lines[i], prefix) {
+			t.Errorf("startup stderr line %d = %q, want prefix %q", i+1, lines[i], prefix)
+		}
+	}
+}
+
 // openIsolatedCloudRuntimeSchema mirrors cloudstore's own
 // openIsolatedCloudStore test helper (a fresh Postgres schema per test, via
 // search_path) so this end-to-end runtime-wiring test can run repeatedly and
@@ -89,7 +142,7 @@ func TestCloudRuntimeWiresManagedTokenAuthEndToEnd(t *testing.T) {
 		MaxPushBodyBytes: cloud.DefaultMaxPushBodyBytes,
 	}
 
-	rt, err := newCloudRuntime(cfg)
+	rt, err := newCloudRuntime(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("newCloudRuntime: %v", err)
 	}
@@ -179,7 +232,7 @@ func TestCloudRuntimeWiresManagedTokenAuthEndToEnd(t *testing.T) {
 	// the server must still start and legacy auth must still work.
 	noPepperCfg := cfg
 	noPepperCfg.TokenPepper = ""
-	noPepperRT, err := newCloudRuntime(noPepperCfg)
+	noPepperRT, err := newCloudRuntime(context.Background(), noPepperCfg)
 	if err != nil {
 		t.Fatalf("newCloudRuntime with no token pepper must not fail to start: %v", err)
 	}
@@ -206,7 +259,7 @@ func TestCloudRuntimeMutationPushAttributionUsesAuthenticatedPrincipal(t *testin
 	t.Setenv("ENGRAM_CLOUD_TOKEN", legacySyncToken)
 	t.Setenv("ENGRAM_CLOUD_INSECURE_NO_AUTH", "")
 
-	rt, err := newCloudRuntime(cloud.Config{
+	rt, err := newCloudRuntime(context.Background(), cloud.Config{
 		DSN:              testDSN,
 		JWTSecret:        "e2e-attribution-jwt-secret-32-bytes-plus",
 		AllowedProjects:  []string{project},

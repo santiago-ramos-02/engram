@@ -1094,6 +1094,12 @@ func NewWithContext(ctx context.Context, cfg Config) (*Store, error) {
 	return newStoreWithStartupContext(ctx, cfg, true)
 }
 
+// NewWithStartupContext allows cancellation of startup waits while preserving
+// the shared store's lock order. Migrations already in progress finish synchronously.
+func NewWithStartupContext(ctx context.Context, cfg Config) (*Store, error) {
+	return newStoreWithStartupContext(ctx, cfg, false)
+}
+
 // newWithoutRepair is retained as a test helper alias for New.
 func newWithoutRepair(cfg Config) (*Store, error) {
 	return newStore(cfg)
@@ -1128,7 +1134,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 		defer unlockMigration()
 		instanceID, err = ensureInstanceIDLocked(ctx, cfg.DataDir)
 	} else {
-		instanceID, err = EnsureInstanceID(cfg.DataDir)
+		instanceID, err = EnsureInstanceIDContext(ctx, cfg.DataDir)
 	}
 	if err != nil {
 		return nil, err
@@ -1160,7 +1166,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := primeConnection(db); err != nil {
+	if err := primeConnection(ctx, db); err != nil {
 		return nil, err
 	}
 
@@ -1168,11 +1174,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 		return nil, err
 	}
 	s := &Store{db: db, cfg: cfg, instanceID: instanceID, generation: generation, hooks: defaultStoreHooks()}
-	if ownedStartup {
-		err = s.runStartupMigrationsWithLock(true)
-	} else {
-		err = s.runStartupMigrations()
-	}
+	err = s.runStartupMigrations(ctx, ownedStartup)
 	if err != nil {
 		return nil, err
 	}
@@ -1235,8 +1237,7 @@ var walSwitchRetryBackoffs = []time.Duration{
 
 // primeConnection opens the first physical connection with a bounded retry
 // while concurrent cold starts race the rollback-journal-to-WAL conversion.
-func primeConnection(db *sql.DB) error {
-	ctx := context.Background()
+func primeConnection(ctx context.Context, db *sql.DB) error {
 	var conn *sql.Conn
 	var lastErr error
 	for attempt := 0; attempt <= len(walSwitchRetryBackoffs); attempt++ {
@@ -1247,7 +1248,13 @@ func primeConnection(db *sql.DB) error {
 		if !isRetryableSQLiteLockError(lastErr) || attempt == len(walSwitchRetryBackoffs) {
 			return fmt.Errorf("engram: open initial connection: %w", lastErr)
 		}
-		time.Sleep(walSwitchRetryBackoffs[attempt])
+		timer := time.NewTimer(walSwitchRetryBackoffs[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	defer conn.Close()
 
@@ -1270,15 +1277,11 @@ func primeConnection(db *sql.DB) error {
 const schemaVersion = 1
 
 var migrateRunCount atomic.Int64
-var acquireStartupMigrationLock = acquireMigrationLock
+var acquireStartupMigrationLock = acquireMigrationLockContext
 
 // runStartupMigrations serializes migrations and the every-open repair. It
 // never writes a database with a schema version newer than this binary.
-func (s *Store) runStartupMigrations() error {
-	return s.runStartupMigrationsWithLock(false)
-}
-
-func (s *Store) runStartupMigrationsWithLock(startupLockHeld bool) error {
+func (s *Store) runStartupMigrations(ctx context.Context, startupLockHeld bool) error {
 	return s.generation.withStartupChecks(func() error {
 		current, err := s.readUserVersion()
 		if err != nil {
@@ -1288,7 +1291,7 @@ func (s *Store) runStartupMigrationsWithLock(startupLockHeld bool) error {
 			return nil
 		}
 		if !startupLockHeld {
-			unlock, err := acquireStartupMigrationLock(filepath.Join(s.cfg.DataDir, ".migrate.lock"))
+			unlock, err := acquireStartupMigrationLock(ctx, filepath.Join(s.cfg.DataDir, ".migrate.lock"))
 			if err != nil {
 				return fmt.Errorf("engram: acquire migration lock: %w", err)
 			}
@@ -1307,6 +1310,9 @@ func (s *Store) runStartupMigrationsWithLock(startupLockHeld bool) error {
 		}
 		if isFutureSchemaVersion(current) {
 			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		needsVersionStamp := current < schemaVersion
@@ -1810,7 +1816,12 @@ func (s *Store) migrate() error {
 	}...); err != nil {
 		return err
 	}
-	if _, err := s.execHook(s.db, `UPDATE sync_mutations SET disposition = 'pending' WHERE disposition IS NULL OR disposition = ''`); err != nil {
+	// Selecting keys inside the UPDATE lets SQLite scan the covering transport
+	// index, when present, and visit journal table rows only when repair is needed.
+	if _, err := s.execHook(s.db, `
+		UPDATE sync_mutations SET disposition = 'pending'
+		WHERE seq IN (SELECT seq FROM sync_mutations WHERE disposition IS NULL OR disposition = '')
+	`); err != nil {
 		return err
 	}
 	if err := s.addColumnsIfNotExists("sync_state",
@@ -1943,7 +1954,12 @@ func (s *Store) migrate() error {
 	}
 
 	if err := s.withTx(func(tx *sql.Tx) error {
-		_, err := s.execHook(tx, `UPDATE observations SET project = CAST(project AS TEXT) WHERE typeof(project) = 'blob'`)
+		// X'' is the smallest BLOB, and SQLite sorts BLOBs after other
+		// storage classes. This bound lets the existing project index seek.
+		_, err := s.execHook(tx, `
+			UPDATE observations SET project = CAST(project AS TEXT)
+			WHERE typeof(project) = 'blob' AND project >= X''
+		`)
 		return err
 	}); err != nil {
 		return err
@@ -3688,6 +3704,48 @@ func continuationSessionTx(ctx context.Context, tx *sql.Tx, root string) (string
 		return liveID, nil
 	}
 	return prefix + max.Add(max, big.NewInt(1)).String(), nil
+}
+
+var errSessionRegistrationNeedsDirectory = errors.New("session registration needs directory resolution")
+
+// TryRefreshProjectOwnedSession renews a complete, live project-owned registration.
+// A false result leaves registration to the caller's normal directory-aware path.
+func (s *Store) TryRefreshProjectOwnedSession(ctx context.Context, id, project string, timings *WriteTimings) (bool, error) {
+	project, _ = NormalizeProject(project)
+	if validateSessionID(id) != nil || project == "" {
+		return false, nil
+	}
+	const eligible = `SELECT directory FROM sessions
+		WHERE id = ? AND project = ? AND ownership_mode = ? AND ended_at IS NULL
+		AND ifnull(trim(directory, ?), '') <> ''`
+	args := []any{id, project, SessionOwnershipProjectOwned, sqlWhitespaceTrimSet}
+	var directory string
+	// This read avoids reserving a writer for requests that need Git. The row
+	// can change before the writer lock is acquired, so check it again there.
+	if err := s.db.QueryRowContext(ctx, eligible, args...).Scan(&directory); err != nil || strings.TrimSpace(directory) == "" {
+		return false, ctx.Err()
+	}
+	err := s.withWriteTimings(timings, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, eligible, args...).Scan(&directory); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return errSessionRegistrationNeedsDirectory
+			}
+			return err
+		}
+		if strings.TrimSpace(directory) == "" {
+			return errSessionRegistrationNeedsDirectory
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// The UPSERT preserves the eligible row's nonblank identity, so
+		// there is no caller directory to resolve or identity repair to sync.
+		return s.startSessionTx(tx, id, project, "", SessionOwnershipProjectOwned)
+	})
+	if errors.Is(err, errSessionRegistrationNeedsDirectory) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string, isolated bool, timings *WriteTimings, evidence ...*ProjectProvenance) error {
