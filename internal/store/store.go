@@ -930,6 +930,7 @@ type Store struct {
 	instanceID              string
 	generation              *databaseGeneration
 	hooks                   storeHooks
+	readinessDB             *sql.DB
 
 	repairMu        sync.Mutex
 	repairDone      bool
@@ -1180,7 +1181,17 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, cfg: cfg, instanceID: instanceID, generation: generation, hooks: defaultStoreHooks()}
+	readinessDB, err := openGenerationDB(readinessDSN(dbPath), generation, true)
+	if err != nil {
+		return nil, fmt.Errorf("engram: create readiness pool: %w", err)
+	}
+	readinessDB.SetMaxOpenConns(1)
+	defer func() {
+		if !succeeded {
+			_ = readinessDB.Close()
+		}
+	}()
+	s := &Store{db: db, cfg: cfg, instanceID: instanceID, generation: generation, readinessDB: readinessDB, hooks: defaultStoreHooks()}
 	trace.Mark("startup-migrations")
 	err = s.runStartupMigrations(ctx, ownedStartup)
 	if err != nil {
@@ -1204,10 +1215,15 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 
 func (s *Store) Close() error {
 	s.compatibilityClosed.Store(true)
+	if s.readinessDB != nil {
+		return errors.Join(s.readinessDB.Close(), s.db.Close())
+	}
 	return s.db.Close()
 }
 
 // ─── Migrations ──────────────────────────────────────────────────────────────
+
+const sqliteBusyTimeout = "busy_timeout(5000)"
 
 // storeDSN builds the modernc.org/sqlite DSN for dbPath with the session
 // pragmas encoded as _pragma query parameters. The driver applies these to
@@ -1223,7 +1239,7 @@ func storeDSN(dbPath string) string {
 	q := url.Values{}
 	q.Set("_txlock", "immediate")
 	for _, p := range []string{
-		"busy_timeout(5000)",
+		sqliteBusyTimeout,
 		"journal_mode(WAL)",
 		// Leave room for SQLite's default 1,000-frame checkpoint interval
 		// at the largest page size. SQLite applies the limit on safe reuse
@@ -1292,7 +1308,7 @@ func primeConnection(ctx context.Context, db *sql.DB) error {
 const schemaVersion = 1
 
 var migrateRunCount atomic.Int64
-var acquireStartupMigrationLock = acquireMigrationLockContext
+var acquireStartupMigrationLock = acquireMigrationLockOnContention
 
 // runStartupMigrations serializes migrations and the every-open repair. It
 // never writes a database with a schema version newer than this binary.
@@ -1305,8 +1321,21 @@ func (s *Store) runStartupMigrations(ctx context.Context, startupLockHeld bool) 
 		if isFutureSchemaVersion(current) {
 			return nil
 		}
+		var checked *observationNormalizationCheck
 		if !startupLockHeld {
-			unlock, err := acquireStartupMigrationLock(ctx, filepath.Join(s.cfg.DataDir, ".migrate.lock"))
+			var onContention func()
+			if current == schemaVersion {
+				onContention = func() {
+					checked = s.checkObservationNormalization(ctx)
+					if checked != nil {
+						startupTraceFrom(ctx).Mark("observation-normalization-checked")
+					}
+				}
+			}
+			unlock, err := acquireStartupMigrationLock(ctx, filepath.Join(s.cfg.DataDir, ".migrate.lock"), onContention)
+			if checked != nil {
+				defer func(conn *sql.Conn) { _ = conn.Close() }(checked.conn)
+			}
 			if err != nil {
 				return fmt.Errorf("engram: acquire migration lock: %w", err)
 			}
@@ -1333,10 +1362,11 @@ func (s *Store) runStartupMigrations(ctx context.Context, startupLockHeld bool) 
 		needsVersionStamp := current < schemaVersion
 		if needsVersionStamp {
 			migrateRunCount.Add(1)
+			checked = nil
 		}
 		trace := startupTraceFrom(ctx)
 		trace.Mark("migration-work")
-		if err := s.migrate(); err != nil {
+		if err := s.migrateWithObservationCheck(ctx, checked); err != nil {
 			trace.markSQLiteLock("sqlite-migration-lock-result", err)
 			return fmt.Errorf("engram: migration: %w", err)
 		}
@@ -1483,6 +1513,10 @@ func (s *Store) backfillLegacySyncMutationProjects() error {
 }
 
 func (s *Store) migrate() error {
+	return s.migrateWithObservationCheck(context.Background(), nil)
+}
+
+func (s *Store) migrateWithObservationCheck(ctx context.Context, checked *observationNormalizationCheck) error {
 	// Existing and partially migrated schemas can have triggers that need FTS
 	// before the legacy data migrations run. Only an empty schema can defer
 	// creation to migrateFTS, which installs tables and triggers together.
@@ -1931,7 +1965,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 
-	if err := s.normalizeLegacyObservations(); err != nil {
+	if checked.unchanged(ctx, s.generation) {
+		startupTraceFrom(ctx).Mark("observation-normalization-reused")
+	} else if err := s.normalizeLegacyObservations(); err != nil {
 		return err
 	}
 
@@ -2114,15 +2150,7 @@ func (s *Store) migrate() error {
 // to the repairs below; do not cache the result between migration runs.
 func (s *Store) normalizeLegacyObservations() error {
 	var needsNormalization bool
-	if err := s.db.QueryRow(`SELECT EXISTS (
-		SELECT 1 FROM observations
-		WHERE scope IS NULL OR scope = ''
-			OR topic_key = ''
-			OR revision_count IS NULL OR revision_count < 1
-			OR duplicate_count IS NULL OR duplicate_count < 1
-			OR updated_at IS NULL OR updated_at = ''
-			OR sync_id IS NULL OR sync_id = ''
-	)`).Scan(&needsNormalization); err != nil {
+	if err := s.db.QueryRow(observationNormalizationNeeded).Scan(&needsNormalization); err != nil {
 		return fmt.Errorf("inspect legacy observations: %w", err)
 	}
 	if !needsNormalization {
@@ -6137,10 +6165,9 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 
 		tkRows, err := s.db.QueryContext(ctx, tkSQL, tkArgs...)
 		if err == nil {
-			defer tkRows.Close()
 			for tkRows.Next() {
-				if err := ctx.Err(); err != nil {
-					return nil, err
+				if ctx.Err() != nil {
+					break
 				}
 				var sr SearchResult
 				if err := tkRows.Scan(
@@ -6148,17 +6175,16 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 					&sr.ToolName, &sr.Project, &sr.Scope, &sr.Org, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
 					&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt, &sr.SupersededBySyncID,
 				); err != nil {
-					if ctxErr := ctx.Err(); ctxErr != nil {
-						return nil, ctxErr
-					}
 					break
 				}
-				if err := ctx.Err(); err != nil {
-					return nil, err
+				if ctx.Err() != nil {
+					break
 				}
 				sr.Rank = -1000
 				directResults = append(directResults, sr)
 			}
+			// The full-text query needs the same connection, even if Scan stopped early.
+			_ = tkRows.Close()
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
@@ -6295,21 +6321,19 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 
 		tkRows, err := s.db.QueryContext(ctx, tkSQL, tkArgs...)
 		if err == nil {
-			defer func() { _ = tkRows.Close() }()
 			for tkRows.Next() {
-				if err := ctx.Err(); err != nil {
-					return nil, err
+				if ctx.Err() != nil {
+					break
 				}
 				var r SearchPreviewResult
 				if err := scanSearchPreviewRow(tkRows, &r, false); err != nil {
-					if ctxErr := ctx.Err(); ctxErr != nil {
-						return nil, ctxErr
-					}
 					break
 				}
 				r.Rank = -1000
 				directResults = append(directResults, r)
 			}
+			// The full-text query needs the same connection, even if Scan stopped early.
+			_ = tkRows.Close()
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
