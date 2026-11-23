@@ -1113,6 +1113,8 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	trace := startupTraceFrom(ctx)
+	trace.Mark("data-directory")
 	if err := ValidateDataDirectory(cfg.DataDir); err != nil {
 		return nil, err
 	}
@@ -1121,6 +1123,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 	}
 	var instanceID string
 	var err error
+	trace.Mark("identity")
 	if ownedStartup {
 		unlockInstance, lockErr := acquireMigrationLockContext(ctx, filepath.Join(cfg.DataDir, ".instance-id.lock"))
 		if lockErr != nil {
@@ -1143,14 +1146,17 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 		return nil, err
 	}
 
+	trace.Mark("database-file")
 	dbPath := filepath.Join(cfg.DataDir, "engram.db")
 	if err := ensureDatabaseFile(dbPath); err != nil {
 		return nil, fmt.Errorf("engram: create database file: %w", err)
 	}
+	trace.Mark("database-generation")
 	generation, err := newDatabaseGeneration(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("engram: capture database generation: %w", err)
 	}
+	trace.Mark("sqlite-open")
 	db, err := openDB(dbPath, generation)
 	if err != nil {
 		return nil, fmt.Errorf("engram: open database: %w", err)
@@ -1166,6 +1172,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	trace.Mark("sqlite-prime")
 	if err := primeConnection(ctx, db); err != nil {
 		return nil, err
 	}
@@ -1174,6 +1181,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 		return nil, err
 	}
 	s := &Store{db: db, cfg: cfg, instanceID: instanceID, generation: generation, hooks: defaultStoreHooks()}
+	trace.Mark("startup-migrations")
 	err = s.runStartupMigrations(ctx, ownedStartup)
 	if err != nil {
 		return nil, err
@@ -1190,6 +1198,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 		return nil, err
 	}
 	succeeded = true
+	trace.Mark("store-ready")
 	return s, nil
 }
 
@@ -1216,6 +1225,10 @@ func storeDSN(dbPath string) string {
 	for _, p := range []string{
 		"busy_timeout(5000)",
 		"journal_mode(WAL)",
+		// Leave room for SQLite's default 1,000-frame checkpoint interval
+		// at the largest page size. SQLite applies the limit on safe reuse
+		// or final close, so active readers can still retain pending frames.
+		"journal_size_limit(67108864)",
 		"synchronous(NORMAL)",
 		"foreign_keys(1)",
 	} {
@@ -1240,11 +1253,13 @@ var walSwitchRetryBackoffs = []time.Duration{
 func primeConnection(ctx context.Context, db *sql.DB) error {
 	var conn *sql.Conn
 	var lastErr error
+	trace := startupTraceFrom(ctx)
 	for attempt := 0; attempt <= len(walSwitchRetryBackoffs); attempt++ {
 		conn, lastErr = db.Conn(ctx)
 		if lastErr == nil {
 			break
 		}
+		trace.markSQLiteLock("sqlite-prime-lock-result", lastErr)
 		if !isRetryableSQLiteLockError(lastErr) || attempt == len(walSwitchRetryBackoffs) {
 			return fmt.Errorf("engram: open initial connection: %w", lastErr)
 		}
@@ -1319,9 +1334,13 @@ func (s *Store) runStartupMigrations(ctx context.Context, startupLockHeld bool) 
 		if needsVersionStamp {
 			migrateRunCount.Add(1)
 		}
+		trace := startupTraceFrom(ctx)
+		trace.Mark("migration-work")
 		if err := s.migrate(); err != nil {
+			trace.markSQLiteLock("sqlite-migration-lock-result", err)
 			return fmt.Errorf("engram: migration: %w", err)
 		}
+		trace.Mark("migration-work-complete")
 		if needsVersionStamp {
 			if err := s.setUserVersion(schemaVersion); err != nil {
 				return fmt.Errorf("engram: set user_version: %w", err)
@@ -4883,7 +4902,7 @@ func (s *Store) recentUnpinnedObservations(ctx context.Context, project, scope s
 	return s.queryContextObservations(ctx, s.db, query, args, compact)
 }
 
-func (s *Store) compactionObservations(sessionID, project string, pinned bool, limit int) ([]Observation, error) {
+func (s *Store) compactionObservations(ctx context.Context, sessionID, project string, pinned bool, limit int) ([]Observation, error) {
 	pinnedValue := 0
 	if pinned {
 		pinnedValue = 1
@@ -4898,7 +4917,7 @@ func (s *Store) compactionObservations(sessionID, project string, pinned bool, l
 		query += " LIMIT ?"
 		args = append(args, limit)
 	}
-	return s.queryObservations(query, args...)
+	return s.queryContextObservations(ctx, s.db, query, args, false)
 }
 
 // ObservationsNeedingReview returns non-deleted observations whose review_after has passed.
@@ -5353,12 +5372,12 @@ func (s *Store) recentPrompts(ctx context.Context, project string, limit int) ([
 	return results, rows.Err()
 }
 
-func (s *Store) compactionPrompts(sessionID, project string, limit int) ([]Prompt, error) {
+func (s *Store) compactionPrompts(ctx context.Context, sessionID, project string, limit int) ([]Prompt, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 
-	rows, err := s.queryItHook(s.db, `
+	rows, err := s.queryContextSection(ctx, s.db, `
 		SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at
 		FROM user_prompts
 		WHERE session_id = ? AND LOWER(ifnull(project, '')) = ?
@@ -6908,27 +6927,27 @@ func truncateUTF8Prefix(s string, maxBytes int) string {
 
 // FormatCompactionContext returns runtime context that is strictly limited to
 // one persisted session. The session's project is derived from the store and
-// is never supplied by the caller.
-func (s *Store) FormatCompactionContext(sessionID string) (string, error) {
-	session, err := s.GetSession(sessionID)
+// is never supplied by the caller. All reads honor ctx.
+func (s *Store) FormatCompactionContext(ctx context.Context, sessionID string) (string, error) {
+	session, err := s.getSessionContext(ctx, sessionID)
 	if err != nil {
 		return "", err
 	}
 
 	project, _ := NormalizeProject(session.Project)
 	var observationCount int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ? AND LOWER(project) = ? AND deleted_at IS NULL`, session.ID, project).Scan(&observationCount); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM observations WHERE session_id = ? AND LOWER(project) = ? AND deleted_at IS NULL`, session.ID, project).Scan(&observationCount); err != nil {
 		return "", err
 	}
-	pinned, err := s.compactionObservations(session.ID, project, true, 0)
+	pinned, err := s.compactionObservations(ctx, session.ID, project, true, 0)
 	if err != nil {
 		return "", err
 	}
-	observations, err := s.compactionObservations(session.ID, project, false, s.cfg.MaxContextResults)
+	observations, err := s.compactionObservations(ctx, session.ID, project, false, s.cfg.MaxContextResults)
 	if err != nil {
 		return "", err
 	}
-	prompts, err := s.compactionPrompts(session.ID, project, 10)
+	prompts, err := s.compactionPrompts(ctx, session.ID, project, 10)
 	if err != nil {
 		return "", err
 	}
@@ -10745,13 +10764,19 @@ func isRetryableSQLiteLockError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) {
-		primaryCode := sqliteErr.Code() & 0xff
+	if primaryCode, ok := sqlitePrimaryErrorCode(err); ok {
 		return primaryCode == sqlitePrimaryBusy || primaryCode == sqlitePrimaryLocked
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy") || strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "sqlite_locked")
+}
+
+func sqlitePrimaryErrorCode(err error) (int, bool) {
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code() & 0xff, true
+	}
+	return 0, false
 }
 
 func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory, mode string) error {
