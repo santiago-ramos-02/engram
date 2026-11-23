@@ -4084,6 +4084,28 @@ func (s *Store) ResolveRuntimeSessionWithOwnershipMode(root, project, directory,
 	return id, err
 }
 
+// ResolveRuntimeSessionFromDirectoryContext resolves a caller's directory
+// before checking the stored scope. If Git confirms that the input is already
+// a worktree root, reuse that proof for two identical scopes in one snapshot.
+func (s *Store) ResolveRuntimeSessionFromDirectoryContext(ctx context.Context, root, project, directory, mode string) (string, error) {
+	resolved, found := projectpkg.InspectRuntimeWorktreeDirectory(ctx, directory)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if found && resolved == directory {
+		id, err := s.readRuntimeSessionSnapshot(ctx, root, project, directory, mode, func(scope string, _ bool) error {
+			if scope != directory {
+				return errRuntimeSessionNeedsWorktree
+			}
+			return nil
+		})
+		if err != errRuntimeSessionNeedsWorktree {
+			return id, err
+		}
+	}
+	return s.ResolveRuntimeSessionWithOwnershipModeContext(ctx, root, project, resolved, mode)
+}
+
 // ResolveRuntimeSessionWithOwnershipModeContext verifies filesystem scopes
 // outside SQLite and returns the live binding from the final read snapshot.
 func (s *Store) ResolveRuntimeSessionWithOwnershipModeContext(ctx context.Context, root, project, directory, mode string) (string, error) {
@@ -4239,10 +4261,11 @@ func (s *Store) endSessionSummaryOperation(id string, summary any) func(*sql.Tx)
 }
 
 func (s *Store) GetSession(id string) (*Session, error) {
-	return s.getSessionContext(context.Background(), id)
+	return s.GetSessionContext(context.Background(), id)
 }
 
-func (s *Store) getSessionContext(ctx context.Context, id string) (*Session, error) {
+// GetSessionContext reads a session using the caller's context.
+func (s *Store) GetSessionContext(ctx context.Context, id string) (*Session, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, project, ifnull(ownership_mode, ''), directory, started_at, ended_at, summary, runtime_lease_expires_at FROM sessions WHERE id = ?`, id,
 	)
@@ -6953,7 +6976,7 @@ func truncateUTF8Prefix(s string, maxBytes int) string {
 // one persisted session. The session's project is derived from the store and
 // is never supplied by the caller. All reads honor ctx.
 func (s *Store) FormatCompactionContext(ctx context.Context, sessionID string) (string, error) {
-	session, err := s.getSessionContext(ctx, sessionID)
+	session, err := s.GetSessionContext(ctx, sessionID)
 	if err != nil {
 		return "", err
 	}

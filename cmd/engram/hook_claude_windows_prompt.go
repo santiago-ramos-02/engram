@@ -40,36 +40,51 @@ func cmdClaudeWindowsUserPromptSubmit(check bool) {
 	var prompt struct {
 		SessionID string `json:"session_id"`
 	}
-	if err == nil && json.Unmarshal(input, &prompt) == nil && claudeWindowsPromptAlreadyLoaded(stateDir, prompt.SessionID) {
-		_, _ = fmt.Fprintln(os.Stdout, "{}")
-		return
+	var marker string
+	if err == nil && json.Unmarshal(input, &prompt) == nil {
+		marker = claudeWindowsPromptMarkerPath(stateDir, prompt.SessionID)
 	}
-	_ = json.NewEncoder(os.Stdout).Encode(map[string]map[string]string{
+	if marker != "" {
+		if claudeWindowsPromptMarkerExists(marker) {
+			_, _ = fmt.Fprintln(os.Stdout, "{}")
+			return
+		}
+		release, inProgress := reserveClaudeWindowsPrompt(marker + ".pending")
+		if release != nil {
+			defer release()
+		}
+		// Recheck after acquiring the reservation in case a previous writer just finished.
+		if inProgress || claudeWindowsPromptMarkerExists(marker) {
+			_, _ = fmt.Fprintln(os.Stdout, "{}")
+			return
+		}
+	}
+	err = json.NewEncoder(os.Stdout).Encode(map[string]map[string]string{
 		"hookSpecificOutput": {
 			"hookEventName":     "UserPromptSubmit",
 			"additionalContext": claudeWindowsPromptBootstrap(),
 		},
 	})
+	if err == nil && marker != "" {
+		if file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err == nil {
+			_ = file.Close()
+		}
+	}
 }
 
-func claudeWindowsPromptAlreadyLoaded(stateDir, sessionID string) bool {
+func claudeWindowsPromptMarkerPath(stateDir, sessionID string) string {
 	if sessionID == "" {
-		return false
+		return ""
 	}
 	key := sessionID
 	if !claudeWindowsPromptUUID.MatchString(key) {
 		key = "sid-" + hex.EncodeToString([]byte(key))
 	}
 	// Keep ordinary UUID and non-UUID markers compatible with the Bash route.
-	path := filepath.Join(stateDir, "engram-claude-"+key+"-tools-loaded")
-	marker, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err == nil {
-		_ = marker.Close()
-		return false
-	}
-	if !os.IsExist(err) {
-		return false
-	}
+	return filepath.Join(stateDir, "engram-claude-"+key+"-tools-loaded")
+}
+
+func claudeWindowsPromptMarkerExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
 }

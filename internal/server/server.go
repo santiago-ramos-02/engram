@@ -723,7 +723,8 @@ func (s *Server) handleRecentSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
-	session, err := s.store.GetSession(r.PathValue("id"))
+	ctx := r.Context()
+	session, err := s.store.GetSessionContext(ctx, r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			jsonError(w, http.StatusNotFound, "session not found")
@@ -733,7 +734,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	provenance, err := s.store.CaptureProjectProvenance("session", session.ID)
+	provenance, err := s.store.CaptureProjectProvenanceContext(ctx, "session", session.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -920,7 +921,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
 	if err != nil {
-		s.writeProjectResolutionError(w, resolved, err)
+		s.writeProjectResolutionErrorContext(r.Context(), w, resolved, err)
 		return
 	}
 
