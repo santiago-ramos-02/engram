@@ -1,12 +1,13 @@
 package main
 
 import (
-	"github.com/Gentleman-Programming/engram/v3/internal/store"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 func TestSQLiteTempPaths(t *testing.T) {
@@ -38,7 +39,10 @@ func TestSQLiteTempPaths(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			err := prepareSQLiteTemp(data)
+			release, err := prepareSQLiteTemp(data)
+			if release != nil {
+				defer release()
+			}
 			if runtime.GOOS != "windows" {
 				if err != nil || os.Getenv("TEMP") != root || os.Getenv("TMP") != root {
 					t.Fatalf("non-Windows changed environment: %v", err)
@@ -57,9 +61,11 @@ func TestSQLiteTempPaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := prepareSQLiteTemp(data); err != nil {
+			secondRelease, err := prepareSQLiteTemp(data)
+			if err != nil {
 				t.Fatal(err)
 			}
+			defer secondRelease()
 			got, err := os.ReadFile(filepath.Join(data, "tmp", "sqlite", "other-process"))
 			if err != nil || string(got) != "preserve" {
 				t.Fatalf("shared file changed: %q %v", got, err)

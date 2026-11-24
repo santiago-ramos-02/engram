@@ -127,6 +127,7 @@ var (
 	setupAddClaudeCodeMemoryWriteAllowlist = setup.AddClaudeCodeMemoryWriteAllowlist
 	setupEnsureClaudeCodeUserMCP           = setup.EnsureClaudeCodeUserMCP
 	setupSetClaudeWindowsNativePrompt      = setup.SetClaudeWindowsNativePrompt
+	setupSetClaudeWindowsExtendedGuard     = setup.SetClaudeWindowsNativePromptWithExtendedGuard
 	setupVerifyClaudeCodeSlim              = setup.VerifyClaudeCodeSlimCapability
 	scanInputLine                          = fmt.Scanln
 
@@ -823,10 +824,12 @@ func main() {
 	}
 
 	if usesLocalSQLite(os.Args[1:]) {
-		if err := prepareSQLiteTemp(cfg.DataDir); err != nil {
+		release, err := prepareSQLiteTemp(cfg.DataDir)
+		if err != nil {
 			fatal(err)
 			return
 		}
+		defer release()
 	}
 
 	// Migrate orphaned databases that ended up in wrong locations
@@ -976,6 +979,16 @@ var localServeTraceEpoch = time.Now()
 // (foreground mode). It owns the store, server, autosync, and signal loop.
 func serveWith(cfg store.Config, options serveOptions) error {
 	var err error
+	var ownedListener net.Listener
+	if options.sessionOwned {
+		ownedListener, err = inheritedOwnedListener()
+		if err != nil {
+			return err
+		}
+		if ownedListener != nil {
+			defer func() { _ = ownedListener.Close() }()
+		}
+	}
 	readyFile, readyToken := os.Getenv("ENGRAM_RUN_READY_FILE"), os.Getenv("ENGRAM_RUN_READY_TOKEN")
 	detachedDaemon := readyFile != "" && readyToken != ""
 	var startup *server.LocalStartup
@@ -1004,6 +1017,18 @@ func serveWith(cfg store.Config, options serveOptions) error {
 	var s *store.Store
 	if options.sessionOwned {
 		parentEOF = watchOwnedParent(os.Stdin, cancel)
+		if ownedListener != nil {
+			cfg.DataDir = filepath.Clean(cfg.DataDir)
+			if err := store.ValidateDataDirectory(cfg.DataDir); err != nil {
+				return err
+			}
+			if err := retainOwnedStoreLease(ctx, cfg.DataDir); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return err
+			}
+		}
 		s, err = store.NewWithContext(ctx, cfg)
 	} else if startup != nil {
 		trace.Mark("store-open")
@@ -1034,13 +1059,16 @@ func serveWith(cfg store.Config, options serveOptions) error {
 	}
 	if options.sessionOwned {
 		srv.SetSessionOwnedToken(os.Getenv("ENGRAM_TOKEN"))
+		if ownedListener != nil {
+			srv.UseSessionOwnedListener(ownedListener)
+		}
 		srv.SetOnReady(func(addr net.Addr) error {
 			select {
 			case <-parentEOF:
 				return fmt.Errorf("session-owned parent closed before readiness")
 			default:
 			}
-			return emitOwnedReadiness(addr, s.InstanceID())
+			return emitOwnedReadiness(addr, s.InstanceID(), ownedListener != nil)
 		})
 	}
 	// Daemon child mode (`engram run -d`): publish the pidfile and the parent
@@ -3668,6 +3696,8 @@ func cmdSetup(cfg store.Config) {
 		allowMemoryWrites bool
 		nativePrompt      string
 		nativePromptSeen  bool
+		windowsGuard      string
+		windowsGuardSeen  bool
 		slug              string
 		slugSeen          bool
 		extraBareSeen     bool
@@ -3703,6 +3733,10 @@ func cmdSetup(cfg store.Config) {
 			unknownFlagSeen = unknownFlagSeen || nativePromptSeen
 			nativePromptSeen = true
 			nativePrompt = strings.TrimPrefix(token, "--native-windows-prompt=")
+		case token == "--windows-pretooluse" || strings.HasPrefix(token, "--windows-pretooluse="):
+			unknownFlagSeen = unknownFlagSeen || windowsGuardSeen
+			windowsGuardSeen = true
+			windowsGuard = strings.TrimPrefix(token, "--windows-pretooluse=")
 		case strings.HasPrefix(token, "-"):
 			// Unrecognized hyphen-prefixed token: record it but keep
 			// scanning so a --protocol appearing later is still parsed
@@ -3722,10 +3756,19 @@ func cmdSetup(cfg store.Config) {
 	case helpSeen:
 		printSetupUsage()
 		return
-	case nativePromptSeen:
+	case nativePromptSeen || windowsGuardSeen:
 		if slug != "claude-code" || mcpOnly || allowMemoryWrites || protocolFlag || extraBareSeen || unknownFlagSeen ||
-			(nativePrompt != "enable" && nativePrompt != "disable") {
-			fatal(fmt.Errorf("usage: engram setup claude-code --native-windows-prompt=enable|disable"))
+			(nativePrompt != "enable" && nativePrompt != "disable") ||
+			(windowsGuardSeen && (nativePrompt != "enable" || windowsGuard != "extended")) {
+			fatal(fmt.Errorf("usage: engram setup claude-code --native-windows-prompt=enable|disable [--windows-pretooluse=extended with enable]"))
+			return
+		}
+		if windowsGuardSeen {
+			if err := setupSetClaudeWindowsExtendedGuard(); err != nil {
+				fatal(err)
+				return
+			}
+			fmt.Println("Claude Code Windows native prompt hook and extended PreToolUse deadline enabled.")
 			return
 		}
 		if err := setupSetClaudeWindowsNativePrompt(nativePrompt == "enable"); err != nil {
@@ -3869,6 +3912,9 @@ func printSetupUsage() {
 	fmt.Println("  --native-windows-prompt=enable|disable")
 	fmt.Println("                          Windows Claude Code only. Select the native prompt hook")
 	fmt.Println("                          or return to Bash in the managed user plugin.")
+	fmt.Println("  --windows-pretooluse=extended")
+	fmt.Println("                          With --native-windows-prompt=enable, allow 10 seconds")
+	fmt.Println("                          for Claude and 7 seconds for Engram session confirmation.")
 	fmt.Println("  --help, -h              Show this help and exit.")
 }
 

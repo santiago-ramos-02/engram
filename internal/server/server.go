@@ -34,9 +34,7 @@ var observedGenerationError = (*store.Store).GenerationError
 
 var checkServerReadiness = (*store.Store).CheckReadiness
 
-var loadServerStats = func(s *store.Store) (*store.Stats, error) {
-	return s.Stats()
-}
+var loadServerStats = (*store.Store).StatsContext
 
 // ErrPortOwned reports that another live serve process of the same engram
 // instance already owns the TCP port. Start returns it instead of exiting
@@ -127,6 +125,11 @@ func New(s *store.Store, port int) *Server {
 // SetSessionOwnedToken enables authentication on the entire handler, including health.
 // Configure before Start; the private token is immutable for this child's lifetime.
 func (s *Server) SetSessionOwnedToken(token string) { s.sessionOwnedToken = token }
+
+// UseSessionOwnedListener supplies the validated listener before Start.
+func (s *Server) UseSessionOwnedListener(listener net.Listener) {
+	s.listen = func(string, string) (net.Listener, error) { return listener, nil }
+}
 
 // SetOnReady publishes the bound listener before serving, never before bind succeeds.
 func (s *Server) SetOnReady(fn func(net.Addr) error) { s.onReady = fn }
@@ -337,7 +340,7 @@ func (s *Server) Start() error {
 			return err
 		}
 	}
-	log.Printf("[engram] HTTP server listening on %s", addr)
+	log.Printf("[engram] HTTP server listening on %s", ln.Addr())
 	err = serveFn(ln, s.Handler())
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -518,6 +521,16 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("GET /internal/managed-runtime/scopes", s.handleManagedRuntimeScopes)
+	s.mux.HandleFunc("POST /internal/managed-runtime/admit", s.handleManagedRuntime)
+	s.mux.HandleFunc("POST /internal/managed-runtime/attach", s.handleManagedRuntime)
+	s.mux.HandleFunc("POST /internal/managed-runtime/hosts", s.handleManagedRuntime)
+	s.mux.HandleFunc("POST /internal/managed-runtime/retire", s.handleManagedRuntime)
+	s.mux.HandleFunc("POST /internal/managed-runtime/write-intent", s.handleManagedRuntime)
+	s.mux.HandleFunc("POST /internal/managed-runtime/save", s.handleManagedRuntime)
+	s.mux.HandleFunc("POST /internal/managed-runtime/update", s.handleManagedObservationUpdate)
+	s.mux.HandleFunc("POST /internal/managed-runtime/recover-writes", s.handleManagedRuntime)
+	s.mux.HandleFunc("POST /internal/managed-runtime/close", s.handleManagedRuntime)
 	s.mux.HandleFunc("GET /compatibility", requireAuth(s.handleCompatibility))
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	// Pi runtime declarations and these route bindings share one Go authority.
@@ -1645,7 +1658,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		var unknown *projectpkg.UnknownProjectError
 		if errors.As(err, &unknown) {
 			// The available-project lookup can fail independently of resolution.
-			available, listErr := s.store.ListProjectNames()
+			available, listErr := s.store.ListProjectNamesContext(r.Context())
 			if listErr != nil {
 				jsonErrorWithFields(w, http.StatusInternalServerError, "project resolution failed", map[string]any{"code": "project_resolution_failed"})
 				return
@@ -1665,9 +1678,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	var stats *store.Stats
 	if resolved.Project != "" {
-		stats, err = s.store.StatsProject(resolved.Project)
+		stats, err = s.store.StatsProjectContext(r.Context(), resolved.Project)
 	} else {
-		stats, err = loadServerStats(s.store)
+		stats, err = loadServerStats(s.store, r.Context())
 	}
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "stats unavailable")

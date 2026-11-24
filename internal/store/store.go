@@ -326,7 +326,8 @@ type AddObservationParams struct {
 	OperationID       string             `json:"operation_id,omitempty"`
 	Timings           *WriteTimings      `json:"-"`
 	// Org is a free-text grouping axis orthogonal to Scope (#776). Empty means unset.
-	Org string `json:"org,omitempty"`
+	Org            string `json:"org,omitempty"`
+	managedRuntime *managedRuntimeWrite
 }
 
 // WriteTimings collects one write operation's local database stages. It holds
@@ -3645,13 +3646,13 @@ func (s *Store) StartSession(id, project, directory string) error {
 // lease. It preserves the existing session identity and refuses to reopen an
 // ended session; EndSession remains terminal truth.
 func (s *Store) StartSessionWithOwnershipMode(id, project, directory, mode string) error {
-	return s.startSessionRegistration(id, project, directory, mode, false, nil, false, nil)
+	return s.startSessionRegistration(id, project, directory, mode, false, nil, false, nil, nil, nil)
 }
 
 // StartSessionWithOwnershipModeTimed records database-stage timings without
 // changing session-registration behavior.
 func (s *Store) StartSessionWithOwnershipModeTimed(id, project, directory, mode string, timings *WriteTimings) error {
-	return s.startSessionRegistration(id, project, directory, mode, false, nil, false, timings)
+	return s.startSessionRegistration(id, project, directory, mode, false, nil, false, timings, nil, nil)
 }
 
 // ResumeSessionWithOwnershipMode atomically selects and registers a live runtime
@@ -3664,7 +3665,7 @@ func (s *Store) ResumeSessionWithOwnershipMode(id, project, directory, mode stri
 // changing runtime-session continuation selection.
 func (s *Store) ResumeSessionWithOwnershipModeTimed(id, project, directory, mode string, timings *WriteTimings) (string, error) {
 	effective := id
-	err := s.startSessionRegistration(id, project, directory, mode, true, &effective, false, timings)
+	err := s.startSessionRegistration(id, project, directory, mode, true, &effective, false, timings, nil, nil)
 	if err != nil {
 		return "", err
 	}
@@ -3688,7 +3689,7 @@ func (s *Store) RegisterIsolatedSession(id, project string, resume bool) (string
 // isolated-session validation or persistence.
 func (s *Store) RegisterIsolatedSessionTimed(id, project string, resume bool, timings *WriteTimings) (string, error) {
 	effective := id
-	if err := s.startSessionRegistration(id, project, "", SessionOwnershipProjectOwned, resume, &effective, true, timings); err != nil {
+	if err := s.startSessionRegistration(id, project, "", SessionOwnershipProjectOwned, resume, &effective, true, timings, nil, nil); err != nil {
 		return "", err
 	}
 	return effective, nil
@@ -3804,11 +3805,7 @@ func (s *Store) TryRefreshProjectOwnedSession(ctx context.Context, id, project s
 	return err == nil, err
 }
 
-func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string, isolated bool, timings *WriteTimings, evidence ...*ProjectProvenance) error {
-	var provenance *ProjectProvenance
-	if len(evidence) != 0 {
-		provenance = evidence[0]
-	}
+func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string, isolated bool, timings *WriteTimings, provenance *ProjectProvenance, managed *managedRuntimeAdmission) error {
 	if err := provenance.Validate(); err != nil {
 		return err
 	}
@@ -3896,6 +3893,9 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 			}
 			*effective = id
 		}
+		if managed != nil && managed.scope.EffectiveID != "" && id != managed.scope.EffectiveID {
+			return ErrRuntimeSessionEffectiveIDMismatch
+		}
 		if id != root {
 			if err := validateIsolation(id); err != nil {
 				return err
@@ -3912,6 +3912,9 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 				return err
 			}
 			if endedAt != nil {
+				if managed != nil {
+					return ErrSessionAlreadyEnded
+				}
 				// Preserve the same child-ownership invariant as write adoption.
 				_, foreignOwner, err := foreignRecordOwnerTx(tx, id, project)
 				if err != nil {
@@ -3971,6 +3974,14 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 		}
 		if err := s.startSessionTx(tx, id, registrationProject, registrationDirectory, registrationMode); err != nil {
 			return err
+		}
+		if managed != nil {
+			selected := *managed
+			selected.scope.EffectiveID = id
+			if err := s.admitManagedRuntimeTx(tx, &selected); err != nil {
+				return err
+			}
+			managed.generation = selected.generation
 		}
 		if !found && (provenance == nil || !provenance.rootRegistrationOnly || id == root) {
 			if err := captureProjectProvenanceTx(tx, "session", id, provenance); err != nil {
@@ -4198,6 +4209,9 @@ func (s *Store) endRuntimeSession(root, project, directory, mode, summary, expec
 		}
 		if expectedID != "" && currentID != expectedID {
 			return ErrRuntimeSessionEffectiveIDMismatch
+		}
+		if err := requireUnmanagedRuntimeCloseTx(tx, currentID); err != nil {
+			return err
 		}
 		id = currentID
 		return s.endSessionOperation(id, summary)(tx)
@@ -4548,10 +4562,10 @@ func ValidateObservationTitle(title string) error {
 // effect-bearing inputs for an observation save. It must include every input
 // that would change the persisted state if it differed, and it must be
 // computed from normalized request fields, before resolving session ownership.
-func observationSaveFingerprint(p AddObservationParams, title, content, project, scope, topicKey string) string {
+func observationSaveFingerprint(p AddObservationParams, title, content, project, scope, topicKey string, extra ...string) string {
 	h := sha256.New()
 	var length [8]byte
-	for _, v := range []string{p.SessionID, p.Type, title, content, p.ToolName, project, scope, topicKey} {
+	for _, v := range append([]string{p.SessionID, p.Type, title, content, p.ToolName, project, scope, topicKey}, extra...) {
 		binary.BigEndian.PutUint64(length[:], uint64(len(v)))
 		h.Write(length[:])
 		h.Write([]byte(v))
@@ -4635,15 +4649,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	return result.ID, err
 }
 
-// AddObservationWithResult persists an observation or returns an exact replay
-// outcome from the operation ledger in the same transaction.
-func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservationResult, error) {
-	if err := p.ProjectProvenance.Validate(); err != nil {
-		return AddObservationResult{}, err
-	}
-	// Normalize project name (lowercase + trim) before any persistence
-	p.Project, _ = NormalizeProject(p.Project)
-
+func (s *Store) prepareObservationBody(p AddObservationParams) (string, string, error) {
 	// Strip <private>...</private> tags before persisting ANYTHING.
 	title := stripPrivateTags(p.Title)
 	content, _ := s.prepareStoredContent(p.Content)
@@ -4653,12 +4659,29 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 	// observation also enqueues a cloud upsert that the sync validators reject,
 	// which blocks every later mutation for the project (#459).
 	if err := ValidateObservationTitle(title); err != nil {
-		return AddObservationResult{}, err
+		return "", "", err
 	}
 	if content == "" {
-		return AddObservationResult{}, ErrObservationContentRequired
+		return "", "", ErrObservationContentRequired
 	}
+	return title, content, nil
+}
 
+// AddObservationWithResult persists an observation or returns an exact replay
+// outcome from the operation ledger in the same transaction.
+func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservationResult, error) {
+	if err := p.ProjectProvenance.Validate(); err != nil {
+		return AddObservationResult{}, err
+	}
+	p.Project, _ = NormalizeProject(p.Project)
+	title, content, err := s.prepareObservationBody(p)
+	if err != nil {
+		return AddObservationResult{}, err
+	}
+	return s.addPreparedObservation(p, title, content)
+}
+
+func (s *Store) addPreparedObservation(p AddObservationParams, title, content string) (AddObservationResult, error) {
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
@@ -4668,6 +4691,17 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 	replayed := false
 	err := s.withWriteTimings(p.Timings, func(tx *sql.Tx) error {
 		replayed = false
+		var managedConfirmed bool
+		if p.managedRuntime != nil {
+			if err := s.ensureManagedRuntimeWriteColumns(tx); err != nil {
+				return err
+			}
+			var err error
+			managedConfirmed, err = p.managedRuntime.intentState(tx, p.OperationID, managedObservationFingerprint(p, title, content, scope, topicKey))
+			if err != nil {
+				return err
+			}
+		}
 		// If the caller supplied an operation ID, check for a committed result first
 		// so a replay can return the original outcome without repeating mutations.
 		// The check runs inside the transaction so it races safely with concurrent
@@ -4683,6 +4717,9 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 				p.OperationID,
 			).Scan(&committedID, &committedFingerprint)
 			if err == nil {
+				if p.managedRuntime != nil && !managedConfirmed {
+					return ErrObservationOperationConflict
+				}
 				if !strings.HasPrefix(committedFingerprint, "v1:") {
 					return ErrObservationOperationExpired
 				}
@@ -4697,6 +4734,16 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 				return ErrObservationOperationConflict
 			}
 			if err != sql.ErrNoRows {
+				return err
+			}
+			if p.managedRuntime == nil {
+				if err := rejectManagedUpdateOperation(tx, p.OperationID); err != nil {
+					return err
+				}
+			}
+		}
+		if p.managedRuntime != nil {
+			if _, err := s.execHook(tx, "UPDATE managed_runtime_writes SET confirmed=1, observation_payload=NULL WHERE operation_id=?", p.OperationID); err != nil {
 				return err
 			}
 		}
@@ -5735,127 +5782,142 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 }
 
 func (s *Store) updateObservation(id int64, p UpdateObservationParams, expected *string) (*Observation, error) {
+	if err := s.validateObservationUpdate(p); err != nil {
+		return nil, err
+	}
+	var updated *Observation
+	err := s.withTx(func(tx *sql.Tx) error {
+		var err error
+		updated, err = s.updateObservationTx(tx, id, p, expected)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+func (s *Store) validateObservationUpdate(p UpdateObservationParams) error {
 	// Admission runs before the transaction so a rejected update opens no
 	// transaction, touches no row and enqueues no sync mutation. The title is
 	// checked post-strip so redaction cannot smuggle an empty one through.
 	hasFindReplace := p.Find != nil || p.Replace != nil
 	if hasFindReplace && (p.Find == nil || p.Replace == nil) {
-		return nil, ErrObservationFindReplacePairRequired
+		return ErrObservationFindReplacePairRequired
 	}
 	if hasFindReplace && p.Content != nil {
-		return nil, ErrObservationFindReplaceContentConflict
+		return ErrObservationFindReplaceContentConflict
 	}
 	if hasFindReplace && (len(*p.Find) > s.cfg.MaxObservationLength || len(*p.Replace) > s.cfg.MaxObservationLength) {
-		return nil, ErrObservationFindReplaceInputTooLarge
+		return ErrObservationFindReplaceInputTooLarge
 	}
 	if p.Title != nil {
 		if err := ValidateObservationTitle(stripPrivateTags(*p.Title)); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if p.Content != nil && stripPrivateTags(*p.Content) == "" {
-		return nil, ErrObservationContentRequired
+		return ErrObservationContentRequired
 	}
 
+	return nil
+}
+
+func (s *Store) updateObservationTx(tx *sql.Tx, id int64, p UpdateObservationParams, expected *string) (*Observation, error) {
 	hasMetadata := p.Type != nil || p.Title != nil || p.Project != nil || p.Scope != nil || p.TopicKey != nil
-	var updated *Observation
-	err := s.withTx(func(tx *sql.Tx) error {
-		obs, err := s.getObservationTx(tx, id)
-		if errors.Is(err, sql.ErrNoRows) && expected != nil {
-			return ErrObservationNotFound
-		}
-		if err != nil {
-			return err
-		}
-
-		if err := checkExpectedObservationProject(obs, expected); err != nil {
-			return err
-		}
-
-		typ := obs.Type
-		title := obs.Title
-		content := obs.Content
-		project := derefString(obs.Project)
-		if strings.TrimSpace(project) == "" {
-			return ErrProjectRequired
-		}
-		scope := obs.Scope
-		topicKey := derefString(obs.TopicKey)
-
-		if p.Type != nil {
-			typ = *p.Type
-		}
-		if p.Title != nil {
-			title = stripPrivateTags(*p.Title)
-		}
-		if p.Content != nil {
-			content, _ = s.prepareStoredContent(*p.Content)
-		}
-		if hasFindReplace {
-			var contentNoop bool
-			content, contentNoop, err = replaceObservationContent(content, *p.Find, *p.Replace, s.cfg.MaxObservationLength)
-			if err != nil {
-				return err
-			}
-			if contentNoop && !hasMetadata {
-				updated = obs
-				return nil
-			}
-		}
-		if p.Project != nil {
-			requestedProject, _ := NormalizeProject(*p.Project)
-			if requestedProject != project {
-				return ErrObservationProjectImmutable
-			}
-		}
-		if p.Scope != nil {
-			scope = normalizeScope(*p.Scope)
-		}
-		if p.TopicKey != nil {
-			topicKey = normalizeTopicKey(*p.TopicKey)
-		}
-
-		// Capture the pre-update state when the user-visible content (title or
-		// body) actually changes (#184). Metadata-only updates (type, scope,
-		// topic_key) do not create a version entry.
-		if title != obs.Title || content != obs.Content {
-			if err := s.captureObservationVersionTx(tx, obs); err != nil {
-				return err
-			}
-		}
-
-		if _, err := s.execHook(tx,
-			`UPDATE observations
-			 SET type = ?,
-			     title = ?,
-			     content = ?,
-			     project = CAST(? AS TEXT),
-			     scope = ?,
-			     topic_key = ?,
-			     normalized_hash = ?,
-			     revision_count = revision_count + 1,
-			     updated_at = ?
-			 WHERE id = ? AND deleted_at IS NULL`,
-			typ,
-			title,
-			content,
-			nullableString(project),
-			scope,
-			nullableString(topicKey),
-			hashNormalized(content),
-			Now(),
-			id,
-		); err != nil {
-			return err
-		}
-
-		updated, err = s.getObservationTx(tx, id)
-		if err != nil {
-			return err
-		}
-		return s.enqueueSyncMutationTx(tx, SyncEntityObservation, updated.SyncID, SyncOpUpsert, observationPayloadFromObservation(updated))
-	})
+	obs, err := s.getObservationTx(tx, id)
+	if errors.Is(err, sql.ErrNoRows) && expected != nil {
+		return nil, ErrObservationNotFound
+	}
 	if err != nil {
+		return nil, err
+	}
+
+	if err := checkExpectedObservationProject(obs, expected); err != nil {
+		return nil, err
+	}
+
+	typ := obs.Type
+	title := obs.Title
+	content := obs.Content
+	project := derefString(obs.Project)
+	if strings.TrimSpace(project) == "" {
+		return nil, ErrProjectRequired
+	}
+	scope := obs.Scope
+	topicKey := derefString(obs.TopicKey)
+
+	if p.Type != nil {
+		typ = *p.Type
+	}
+	if p.Title != nil {
+		title = stripPrivateTags(*p.Title)
+	}
+	if p.Content != nil {
+		content, _ = s.prepareStoredContent(*p.Content)
+	}
+	if p.Find != nil {
+		var contentNoop bool
+		content, contentNoop, err = replaceObservationContent(content, *p.Find, *p.Replace, s.cfg.MaxObservationLength)
+		if err != nil {
+			return nil, err
+		}
+		if contentNoop && !hasMetadata {
+			return obs, nil
+		}
+	}
+	if p.Project != nil {
+		requestedProject, _ := NormalizeProject(*p.Project)
+		if requestedProject != project {
+			return nil, ErrObservationProjectImmutable
+		}
+	}
+	if p.Scope != nil {
+		scope = normalizeScope(*p.Scope)
+	}
+	if p.TopicKey != nil {
+		topicKey = normalizeTopicKey(*p.TopicKey)
+	}
+
+	// Capture the pre-update state when the user-visible content (title or
+	// body) actually changes (#184). Metadata-only updates (type, scope,
+	// topic_key) do not create a version entry.
+	if title != obs.Title || content != obs.Content {
+		if err := s.captureObservationVersionTx(tx, obs); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, err := s.execHook(tx,
+		`UPDATE observations
+		 SET type = ?,
+		     title = ?,
+		     content = ?,
+		     project = CAST(? AS TEXT),
+		     scope = ?,
+		     topic_key = ?,
+		     normalized_hash = ?,
+		     revision_count = revision_count + 1,
+		     updated_at = ?
+		 WHERE id = ? AND deleted_at IS NULL`,
+		typ,
+		title,
+		content,
+		nullableString(project),
+		scope,
+		nullableString(topicKey),
+		hashNormalized(content),
+		Now(),
+		id,
+	); err != nil {
+		return nil, err
+	}
+
+	updated, err := s.getObservationTx(tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, updated.SyncID, SyncOpUpsert, observationPayloadFromObservation(updated)); err != nil {
 		return nil, err
 	}
 	return updated, nil
@@ -6608,21 +6670,31 @@ func buildPromptLIKEQuery(query, project string, limit int) (string, []any) {
 // ─── Stats ───────────────────────────────────────────────────────────────────
 
 func (s *Store) Stats() (*Stats, error) {
-	return s.statsForProject("")
+	return s.StatsContext(context.Background())
+}
+
+// StatsContext returns aggregate counts and project names with cancellation.
+func (s *Store) StatsContext(ctx context.Context) (*Stats, error) {
+	return s.statsForProject(ctx, "")
 }
 
 // StatsProject returns aggregate counts restricted to one project. Selection
 // policy belongs to callers; this method only applies the supplied scope.
 func (s *Store) StatsProject(project string) (*Stats, error) {
+	return s.StatsProjectContext(context.Background(), project)
+}
+
+// StatsProjectContext returns aggregate counts for one project with cancellation.
+func (s *Store) StatsProjectContext(ctx context.Context, project string) (*Stats, error) {
 	project, _ = NormalizeProject(project)
 	if strings.TrimSpace(project) == "" {
 		return nil, fmt.Errorf("project is required")
 	}
-	return s.statsForProject(project)
+	return s.statsForProject(ctx, project)
 }
 
-func (s *Store) statsForProject(project string) (*Stats, error) {
-	stats, _, err := s.statsForProjectLimit(project, 0)
+func (s *Store) statsForProject(ctx context.Context, project string) (*Stats, error) {
+	stats, _, err := s.statsForProjectLimit(ctx, project, 0)
 	return stats, err
 }
 
@@ -6638,10 +6710,10 @@ func (s *Store) ContextStats(project string, maxProjects int) (*Stats, int, erro
 			return nil, 0, fmt.Errorf("project is required")
 		}
 	}
-	return s.statsForProjectLimit(project, maxProjects)
+	return s.statsForProjectLimit(context.Background(), project, maxProjects)
 }
 
-func (s *Store) statsForProjectLimit(project string, maxProjects int) (*Stats, int, error) {
+func (s *Store) statsForProjectLimit(ctx context.Context, project string, maxProjects int) (*Stats, int, error) {
 	stats := &Stats{}
 	args := []any{}
 	where := ""
@@ -6649,17 +6721,17 @@ func (s *Store) statsForProjectLimit(project string, maxProjects int) (*Stats, i
 		where = " WHERE LOWER(project) = ?"
 		args = append(args, project)
 	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM sessions"+where, args...).Scan(&stats.TotalSessions); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sessions"+where, args...).Scan(&stats.TotalSessions); err != nil {
 		return nil, 0, err
 	}
 	observationsFilter := ""
 	if project != "" {
 		observationsFilter = " AND LOWER(project) = ?"
 	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL"+observationsFilter, args...).Scan(&stats.TotalObservations); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL"+observationsFilter, args...).Scan(&stats.TotalObservations); err != nil {
 		return nil, 0, err
 	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM user_prompts"+where, args...).Scan(&stats.TotalPrompts); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM user_prompts"+where, args...).Scan(&stats.TotalPrompts); err != nil {
 		return nil, 0, err
 	}
 
@@ -6680,7 +6752,7 @@ func (s *Store) statsForProjectLimit(project string, maxProjects int) (*Stats, i
 		projectsQuery = "SELECT project, COUNT(*) OVER () FROM (" + projectsQuery + ") ORDER BY latest_created_at DESC LIMIT ?"
 		args = append(args, maxProjects)
 	}
-	rows, err := s.queryItHook(s.db, projectsQuery, args...)
+	rows, err := s.queryContextSection(ctx, s.db, projectsQuery, args...)
 	if err != nil {
 		return nil, 0, err
 	}
